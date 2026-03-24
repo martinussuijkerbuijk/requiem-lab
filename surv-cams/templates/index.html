@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>REQUIEM</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --c-vigil:   #00e078;
+  --c-hunt:    #00ff88;
+  --c-center:  #e83030;
+  --c-zoom:    #00e5ff;
+  --c-analyze: #aaff00;
+  --c-bless:   #ffd060;
+}
+
+html, body {
+  width: 100%; height: 100%;
+  background: #000;
+  overflow: hidden;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  cursor: none;
+}
+
+/* Fixed viewport — canvas coordinates are always 1280×720 */
+#viewport {
+  position: relative;
+  width: 1280px;
+  height: 720px;
+  flex-shrink: 0;
+  /* Scale down to fit the screen without distortion */
+  transform-origin: center center;
+}
+
+/* MJPEG feed — cold blue-grey tint (GPU filter) */
+#feed {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  filter: grayscale(1) brightness(0.85) sepia(0.6) hue-rotate(175deg) saturate(3);
+  transition: filter 2.5s ease;
+}
+body.bless  #feed { filter: brightness(1.05) sepia(0.5) saturate(1.8) hue-rotate(10deg); }
+body.vigil  #feed { filter: grayscale(1) brightness(0.6) sepia(0.4) hue-rotate(200deg) saturate(2); }
+
+/* Detection canvas — same pixel dimensions as the video */
+#overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+/* CSS scanlines — zero CPU */
+#scanlines {
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0px, transparent 3px,
+    rgba(0,0,0,0.11) 3px, rgba(0,0,0,0.11) 4px
+  );
+  pointer-events: none;
+}
+
+/* CRT vignette */
+#vignette {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse at 50% 50%, transparent 50%, rgba(0,0,0,0.72) 100%);
+  pointer-events: none;
+}
+
+/* HUD text */
+.hud {
+  position: absolute;
+  font-family: 'Courier New', Courier, monospace;
+  font-size: 11px;
+  line-height: 1.8;
+  letter-spacing: 0.07em;
+  color: #00ff41;
+  text-shadow: 0 0 7px #00ff41;
+  pointer-events: none;
+  user-select: none;
+  text-transform: uppercase;
+}
+#hud-tl { top: 14px;    left: 14px; }
+#hud-tr { top: 14px;    right: 14px; text-align: right; }
+#hud-bl { bottom: 14px; left: 14px; }
+#hud-br { bottom: 14px; right: 14px; text-align: right; }
+
+#hud-state {
+  font-size: 14px;
+  font-weight: bold;
+  letter-spacing: 0.15em;
+}
+
+.cyan   { color: #00ccff; text-shadow: 0 0 7px #00ccff; }
+.red    { color: #ff3333; text-shadow: 0 0 7px #ff3333; }
+.orange { color: #ff8800; text-shadow: 0 0 7px #ff8800; }
+.pink   { color: #ff00aa; text-shadow: 0 0 7px #ff00aa; }
+.gold   { color: #ffd060; text-shadow: 0 0 7px #ffd060; }
+.dim    { opacity: 0.5; }
+
+/* Bottom progress bar */
+#progress-bar {
+  position: absolute;
+  bottom: 0; left: 0;
+  height: 3px;
+  width: 0%;
+  background: #00ff41;
+  box-shadow: 0 0 6px #00ff41;
+  pointer-events: none;
+  transition: background-color 0.3s;
+}
+
+/* Operator controls (press C) */
+#controls {
+  position: absolute;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: none;
+  gap: 8px;
+  pointer-events: all;
+  z-index: 10;
+}
+#controls button {
+  background: rgba(0,0,0,0.8);
+  border: 1px solid #00ff41;
+  color: #00ff41;
+  font-family: 'Courier New', monospace;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 5px 12px;
+  cursor: pointer;
+  text-shadow: 0 0 6px currentColor;
+}
+#controls button:hover { border-color: #00e5ff; color: #00e5ff; }
+
+@keyframes blink { 50% { opacity: 0; } }
+.blink { animation: blink 1.2s step-end infinite; }
+</style>
+</head>
+<body class="vigil">
+
+<div id="viewport">
+  <img id="feed" src="/video_feed" alt="">
+  <canvas id="overlay" width="1280" height="720"></canvas>
+  <div id="scanlines"></div>
+  <div id="vignette"></div>
+
+  <!-- Top-left: state + mode -->
+  <div id="hud-tl" class="hud">
+    <div id="hud-state">VIGIL</div>
+    <div id="hud-mode" class="dim"></div>
+    <div id="hud-faces" class="dim"></div>
+  </div>
+
+  <!-- Top-right: clock + zoom -->
+  <div id="hud-tr" class="hud">
+    <div id="hud-clock">--:--:--</div>
+    <div id="hud-zoom"  class="dim"></div>
+    <div class="dim">CAM 01</div>
+  </div>
+
+  <!-- Bottom-left: psych readout -->
+  <div id="hud-bl" class="hud">
+    <div id="hud-psych"></div>
+    <div id="hud-tension"></div>
+  </div>
+
+  <!-- Bottom-right: blessed counter + elapsed -->
+  <div id="hud-br" class="hud">
+    <div id="hud-blessed" class="dim"></div>
+    <div id="hud-elapsed" class="dim blink"></div>
+  </div>
+
+  <div id="progress-bar"></div>
+
+  <!-- Operator controls: press C to toggle -->
+  <div id="controls">
+    <button onclick="cmd('start')">START</button>
+    <button onclick="cmd('stop')">STOP</button>
+    <button onclick="cmd('bless')">BLESS</button>
+    <button onclick="cmd('analyze')">ANALYZE</button>
+    <button onclick="cmd('home')">HOME</button>
+    <button onclick="cmd('reset')">RESET</button>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// ── Canvas ────────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('overlay');
+const ctx    = canvas.getContext('2d');
+const W = canvas.width;   // 1280
+const H = canvas.height;  // 720
+
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let g = {
+  state: 'VIGIL', faces: [], mp_faces: [], target: null,
+  zoom: 1.0, frame_w: 1280, frame_h: 720, t: 0, elapsed: 0,
+  analyze_p: 0, bless_p: 0, center_p: 0,
+  blessed_n: 0, last_psych: 'COMPLIANT',
+};
+
+// ── Scale: map frame coords → canvas coords ───────────────────────────────────
+// Frame dimensions may differ from 1280×720 but canvas is always 1280×720.
+function sx(x) { return x * W / (g.frame_w || W); }
+function sy(y) { return y * H / (g.frame_h || H); }
+
+// ── Scale viewport to fit the browser window ──────────────────────────────────
+const viewport = document.getElementById('viewport');
+function fitViewport() {
+  const scale = Math.min(window.innerWidth / 1280, window.innerHeight / 720);
+  viewport.style.transform = `scale(${scale})`;
+}
+fitViewport();
+window.addEventListener('resize', fitViewport);
+
+// ── Color palette ─────────────────────────────────────────────────────────────
+const C = {
+  VIGIL:   '#00e078',
+  HUNT:    '#00ff88',
+  CENTER:  '#e83030',
+  ZOOM:    '#00e5ff',
+  ANALYZE: '#aaff00',
+  BLESS:   '#ffd060',
+  eye:     '#00ffff',
+  lip:     '#ff00aa',
+  iris:    '#ff3322',
+};
+const TENSION_COLOR = {
+  NOMINAL:  '#00ff88',
+  ELEVATED: '#ff8800',
+  HIGH:     '#ff00aa',
+  CRITICAL: '#ff3333',
+};
+function sc() { return C[g.state] || C.VIGIL; }
+
+// ── Drawing helpers ───────────────────────────────────────────────────────────
+
+function glow(color, blur)  { ctx.shadowColor = color; ctx.shadowBlur = blur; }
+function noGlow()           { ctx.shadowBlur = 0; }
+
+function brackets(x1, y1, x2, y2, color, arm, lineW, glowBlur) {
+  arm      = arm      ?? 26;
+  lineW    = lineW    ?? 1.8;
+  glowBlur = glowBlur ?? 10;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = lineW;
+  glow(color, glowBlur);
+  ctx.beginPath();
+  ctx.moveTo(x1 + arm, y1); ctx.lineTo(x1, y1); ctx.lineTo(x1, y1 + arm);
+  ctx.moveTo(x2 - arm, y1); ctx.lineTo(x2, y1); ctx.lineTo(x2, y1 + arm);
+  ctx.moveTo(x1 + arm, y2); ctx.lineTo(x1, y2); ctx.lineTo(x1, y2 - arm);
+  ctx.moveTo(x2 - arm, y2); ctx.lineTo(x2, y2); ctx.lineTo(x2, y2 - arm);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function polyline(pts, color, lineW, close) {
+  if (!pts || pts.length < 2) return;
+  lineW = lineW ?? 1.5;
+  close = close ?? true;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = lineW;
+  glow(color, 5);
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  if (close) ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function crosshair(x, y, size, color) {
+  size  = size  ?? 12;
+  color = color ?? C.iris;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = 1.5;
+  glow(color, 8);
+  ctx.beginPath();
+  ctx.moveTo(x - size, y); ctx.lineTo(x + size, y);
+  ctx.moveTo(x, y - size); ctx.lineTo(x, y + size);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function lbl(text, x, y, color, size) {
+  size = size ?? 11;
+  ctx.font      = `${size}px 'Courier New', monospace`;
+  ctx.fillStyle = color;
+  glow(color, 5);
+  ctx.fillText(text, x, y);
+  noGlow();
+}
+
+function arcProgress(cx, cy, r, progress, color) {
+  if (progress <= 0) return;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = 2;
+  glow(color, 8);
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function dashedLine(x1, y1, x2, y2, color, t) {
+  ctx.save();
+  ctx.strokeStyle  = color;
+  ctx.lineWidth    = 1;
+  ctx.globalAlpha  = 0.55;
+  ctx.setLineDash([6, 10]);
+  ctx.lineDashOffset = -(t * 40) % 16;
+  glow(color, 5);
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function ellipseHalo(cx, cy, rx, ry, color, t) {
+  const blur = 14 + 7 * Math.sin(t * 2.2);
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = 2;
+  ctx.globalAlpha = 0.9;
+  glow(color, blur);
+  ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); ctx.stroke();
+  ctx.globalAlpha = 0.4;
+  ctx.lineWidth   = 0.8;
+  ctx.beginPath(); ctx.ellipse(cx, cy, rx * 0.82, ry * 0.82, 0, 0, Math.PI * 2); ctx.stroke();
+  ctx.restore();
+}
+
+// ── Forensic HUD (ZOOM / ANALYZE) ────────────────────────────────────────────
+function forensicHUD(t, color) {
+  const cw = W / 2, ch = H / 2;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = 0.5;
+
+  // Roll arc
+  const arcR = 170;
+  for (let a = -40; a <= 40; a += 5) {
+    const rad = (a - 90) * Math.PI / 180;
+    const isMaj = a % 15 === 0;
+    const r0 = arcR + (isMaj ? 0 : 8), r1 = arcR + 18;
+    const arcY = 120;
+    ctx.lineWidth = isMaj ? 1.5 : 0.8;
+    ctx.beginPath();
+    ctx.moveTo(cw + r0 * Math.cos(rad), arcY + r0 * Math.sin(rad));
+    ctx.lineTo(cw + r1 * Math.cos(rad), arcY + r1 * Math.sin(rad));
+    ctx.stroke();
+  }
+  // Roll indicator triangle
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(cw - 6, 120 - arcR + 2);
+  ctx.lineTo(cw + 6, 120 - arcR + 2);
+  ctx.lineTo(cw,     120 - arcR + 14);
+  ctx.closePath(); ctx.stroke();
+
+  // Centre pitch ladder
+  ctx.lineWidth   = 1;
+  ctx.globalAlpha = 0.35;
+  const gap = 22;
+  for (let dx = -180; dx < -50; dx += 28) {
+    ctx.beginPath(); ctx.moveTo(cw + dx, ch); ctx.lineTo(cw + dx + 14, ch); ctx.stroke();
+  }
+  for (let dx = 50; dx < 180; dx += 28) {
+    ctx.beginPath(); ctx.moveTo(cw + dx, ch); ctx.lineTo(cw + dx + 14, ch); ctx.stroke();
+  }
+  ctx.beginPath();
+  ctx.moveTo(cw, ch - gap); ctx.lineTo(cw, ch - gap - 55);
+  ctx.moveTo(cw, ch + gap); ctx.lineTo(cw, ch + gap + 55);
+  ctx.stroke();
+  [-55, -28, 28, 55].forEach(oy => {
+    const blen = Math.abs(oy) > 40 ? 36 : 18;
+    const tick = oy > 0 ? 5 : -5;
+    ctx.beginPath();
+    ctx.moveTo(cw - blen, ch + oy); ctx.lineTo(cw + blen, ch + oy);
+    ctx.moveTo(cw - blen, ch + oy); ctx.lineTo(cw - blen, ch + oy + tick);
+    ctx.moveTo(cw + blen, ch + oy); ctx.lineTo(cw + blen, ch + oy + tick);
+    ctx.stroke();
+  });
+
+  // Side scales
+  drawScale(55,       ch, ['43','41','39','37','35'], 2, color, false);
+  drawScale(W - 55,   ch, ['110','100','90','87','75'], 2, color, true);
+
+  ctx.restore();
+}
+
+function drawScale(x, cy, vals, hiIdx, color, right) {
+  const step = 18;
+  const top  = cy - step * 2;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.fillStyle   = color;
+  ctx.font        = '9px monospace';
+  ctx.globalAlpha = 0.5;
+  ctx.lineWidth   = 1;
+  ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, top + step * 4); ctx.stroke();
+  vals.forEach((v, i) => {
+    const y = top + i * step;
+    const tlen = right ? -6 : 6;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + tlen, y); ctx.stroke();
+    if (i === hiIdx) { ctx.globalAlpha = 0.9; glow(color, 4); }
+    ctx.textAlign = right ? 'right' : 'left';
+    ctx.fillText(v, right ? x - 10 : x + 10, y + 3);
+    ctx.globalAlpha = 0.5; noGlow();
+  });
+  ctx.restore();
+}
+
+// ── Particle system (BLESS) ───────────────────────────────────────────────────
+const particles = [];
+let _lastSpawn  = 0;
+
+function spawnParticles(cx, cy, color) {
+  for (let i = 0; i < 7; i++) {
+    particles.push({
+      x: cx + (Math.random() - 0.5) * 80,
+      y: cy,
+      vx: (Math.random() - 0.5) * 1.5,
+      vy: -(0.8 + Math.random() * 2),
+      life: 1.0,
+      decay: 0.011 + Math.random() * 0.009,
+      size: 1.5 + Math.random() * 2,
+      color,
+    });
+  }
+}
+
+function tickParticles() {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy;
+    p.life -= p.decay;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    ctx.save();
+    ctx.globalAlpha = p.life * 0.85;
+    ctx.fillStyle   = p.color;
+    glow(p.color, 6);
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ── Moving scanline ───────────────────────────────────────────────────────────
+let scanY = 0;
+function drawScanline() {
+  ctx.save();
+  ctx.strokeStyle = 'rgba(100,220,180,0.1)';
+  ctx.lineWidth   = 1;
+  ctx.beginPath(); ctx.moveTo(0, scanY); ctx.lineTo(W, scanY); ctx.stroke();
+  ctx.restore();
+  scanY = (scanY + 4) % H;
+}
+
+// ── Main render loop ──────────────────────────────────────────────────────────
+function render(ts) {
+  requestAnimationFrame(render);
+  const t = ts * 0.001;
+
+  ctx.clearRect(0, 0, W, H);
+  drawScanline();
+
+  const color  = sc();
+  const cx_mid = W / 2, cy_mid = H / 2;
+
+  // ── VIGIL / all states: frame crosshair ───────────────────────────────────
+  const chAlpha = g.state === 'VIGIL'  ? 0.5 + 0.4 * Math.abs(Math.sin(t * 1.4)) :
+                  g.state === 'CENTER' ? 0.9 : 0.18;
+  ctx.globalAlpha = chAlpha;
+  crosshair(cx_mid, cy_mid, 30, color);
+  ctx.globalAlpha = 1;
+
+  // ── HUNT ──────────────────────────────────────────────────────────────────
+  if (g.state === 'HUNT') {
+    g.faces.forEach(f => {
+      const [x1, y1, x2, y2] = f.bbox.map ? f.bbox : [f.bbox[0],f.bbox[1],f.bbox[2],f.bbox[3]];
+      ctx.globalAlpha = f.is_target ? 0.9 : 0.35;
+      brackets(sx(x1), sy(y1), sx(x2), sy(y2), color, 22, 1.5, f.is_target ? 8 : 0);
+      ctx.globalAlpha = 1;
+    });
+
+    // Radar sweep
+    const ox = W - 55, oy = 55, r = 30;
+    const angle = (t * 1.3) % (Math.PI * 2);
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = 0.4;
+    ctx.lineWidth   = 1;
+    ctx.beginPath(); ctx.arc(ox, oy, r, 0, Math.PI * 2); ctx.stroke();
+    ctx.globalAlpha = 0.7;
+    glow(color, 8);
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(ox, oy);
+    ctx.lineTo(ox + r * Math.cos(angle), oy + r * Math.sin(angle));
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // ── CENTER ────────────────────────────────────────────────────────────────
+  if (g.state === 'CENTER' && g.target) {
+    const [x1, y1, x2, y2] = g.target;
+    const cx1 = sx(x1), cy1 = sy(y1), cx2 = sx(x2), cy2 = sy(y2);
+    const arm = 20 + 10 * Math.abs(Math.sin(t * 7));
+    const lw  = 1.5 + Math.abs(Math.sin(t * 7));
+    brackets(cx1, cy1, cx2, cy2, color, arm, lw, 10);
+
+    const fcx = (cx1 + cx2) / 2, fcy = (cy1 + cy2) / 2;
+    dashedLine(fcx, fcy, cx_mid, cy_mid, color, t);
+
+    const faceW = cx2 - cx1;
+    arcProgress(fcx, fcy, faceW * 0.6, g.center_p, color);
+
+    // Ghost boxes for other faces
+    g.faces.forEach(f => {
+      if (f.is_target) return;
+      ctx.globalAlpha = 0.2;
+      brackets(sx(f.bbox[0]), sy(f.bbox[1]), sx(f.bbox[2]), sy(f.bbox[3]), color, 14, 0.8, 0);
+      ctx.globalAlpha = 1;
+    });
+  }
+
+  // ── ZOOM / ANALYZE ────────────────────────────────────────────────────────
+  if (g.state === 'ZOOM' || g.state === 'ANALYZE') {
+    forensicHUD(t, color);
+
+    if (g.target) {
+      brackets(sx(g.target[0]), sy(g.target[1]), sx(g.target[2]), sy(g.target[3]),
+               color, 24, 1.5, 6);
+    }
+
+    g.mp_faces.forEach(f => {
+      const scaleP = p => [sx(p[0]), sy(p[1])];
+      polyline(f.lm_left_eye.map(scaleP),  C.eye, 1.5);
+      polyline(f.lm_right_eye.map(scaleP), C.eye, 1.5);
+      polyline(f.lm_lips.map(scaleP),      C.lip, 1.5);
+      if (f.lm_left_iris)  crosshair(sx(f.lm_left_iris[0]),  sy(f.lm_left_iris[1]));
+      if (f.lm_right_iris) crosshair(sx(f.lm_right_iris[0]), sy(f.lm_right_iris[1]));
+
+      const tcolor = TENSION_COLOR[f.tension] || color;
+      if (f.lm_left_eye && f.lm_left_eye.length) {
+        const [lx, ly] = [sx(f.lm_left_eye[0][0]), sy(f.lm_left_eye[0][1])];
+        lbl(`ID:${f.id}`,              lx, ly - 30, tcolor);
+        lbl(`TENSION: ${f.tension}`,   lx, ly - 16, tcolor);
+        lbl('PSYCH_EVAL:',             lx, ly -  2, C.eye, 10);
+        lbl(f.psych,                   lx, ly + 12, tcolor);
+      }
+
+      if (g.state === 'ANALYZE') {
+        const all = [...f.lm_left_eye, ...f.lm_right_eye];
+        const acx = all.reduce((s, p) => s + sx(p[0]), 0) / all.length;
+        const acy = all.reduce((s, p) => s + sy(p[1]), 0) / all.length;
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth   = 0.6;
+        glow(color, 3);
+        for (let i = 0; i < 12; i++) {
+          const a = (i / 12) * Math.PI * 2 + t * 0.25;
+          ctx.globalAlpha = 0.25 + 0.12 * Math.sin(t * 1.8 + i);
+          ctx.beginPath();
+          ctx.moveTo(acx + 55 * Math.cos(a), acy + 55 * Math.sin(a));
+          ctx.lineTo(acx + 80 * Math.cos(a), acy + 80 * Math.sin(a));
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+    });
+
+    if (g.state === 'ZOOM') {
+      const pct = Math.round((g.zoom - 1) / (2.5 - 1) * 100);
+      lbl(`ZOOM  ${pct}%`, 20, H - 28, color);
+    }
+  }
+
+  // ── BLESS ─────────────────────────────────────────────────────────────────
+  if (g.state === 'BLESS') {
+    const gold = C.BLESS;
+
+    g.mp_faces.forEach(f => {
+      const scaleP = p => [sx(p[0]), sy(p[1])];
+      polyline(f.lm_left_eye.map(scaleP),  gold, 1.5);
+      polyline(f.lm_right_eye.map(scaleP), gold, 1.5);
+      polyline(f.lm_lips.map(scaleP),      gold, 1.5);
+    });
+
+    if (g.target) {
+      const [x1, y1, x2, y2] = g.target;
+      const hcx = sx((x1 + x2) / 2);
+      const hcy = sy(y1 - (y2 - y1) * 0.25);
+      const rx  = sx(x2 - x1) * 0.65;
+      const ry  = sx(x2 - x1) * 0.18;
+      ellipseHalo(hcx, hcy, rx, ry, gold, t);
+
+      if (t - _lastSpawn > 0.18) {
+        spawnParticles(hcx, hcy - ry, gold);
+        _lastSpawn = t;
+      }
+    }
+    tickParticles();
+
+    // "BLESSED" centre title
+    ctx.save();
+    ctx.globalAlpha = 0.75 + 0.25 * Math.abs(Math.sin(t * 3));
+    ctx.font        = 'bold 38px Courier New, monospace';
+    ctx.textAlign   = 'center';
+    ctx.fillStyle   = gold;
+    glow(gold, 20);
+    ctx.fillText('BLESSED', W / 2, 68);
+    ctx.restore();
+  }
+}
+requestAnimationFrame(render);
+
+// ── HUD DOM updates ───────────────────────────────────────────────────────────
+const STATE_MODE = {
+  VIGIL:   'STANDBY  //  AWAITING INPUT',
+  HUNT:    'SCANNING  //  ACQUIRING',
+  CENTER:  'TARGET LOCK  //  CENTERING',
+  ZOOM:    'TELESCOPING  //  CLOSING IN',
+  ANALYZE: 'FORENSIC ANALYSIS  //  PROCESSING',
+  BLESS:   '\u2746  SUBJECT DESIGNATED  \u2746',
+};
+
+let _prevState = '';
+function updateHUD() {
+  const s = g;
+  if (s.state !== _prevState) {
+    _prevState = s.state;
+    const el   = document.getElementById('hud-state');
+    el.textContent = s.state;
+    // Colour the state badge
+    const col = C[s.state] || C.VIGIL;
+    el.style.color      = col;
+    el.style.textShadow = `0 0 8px ${col}, 0 0 20px ${col}`;
+    document.body.className = s.state.toLowerCase();
+  }
+  document.getElementById('hud-mode').textContent  = STATE_MODE[s.state] || '';
+  document.getElementById('hud-faces').textContent = s.faces.length > 0
+    ? `TARGETS  ${String(s.faces.length).padStart(2,'0')}` : '';
+  document.getElementById('hud-zoom').textContent  = s.zoom > 1.05
+    ? `ZOOM \u00d7${s.zoom.toFixed(2)}` : '';
+  document.getElementById('hud-elapsed').textContent = s.elapsed > 0.5
+    ? `${s.elapsed.toFixed(1)}s` : '';
+  document.getElementById('hud-blessed').textContent = s.blessed_n > 0
+    ? `\u2746  BLESSED  ${String(s.blessed_n).padStart(3,'0')}` : '';
+
+  const pCol = TENSION_COLOR[s.last_psych] ?? '#00ff88';
+  const psychEl   = document.getElementById('hud-psych');
+  const tensionEl = document.getElementById('hud-tension');
+  psychEl.textContent   = s.last_psych !== 'COMPLIANT' ? `PSYCH  ${s.last_psych}` : '';
+  psychEl.style.color   = pCol;
+  psychEl.style.textShadow = `0 0 7px ${pCol}`;
+  tensionEl.textContent = '';
+
+  let prog = 0, progCol = C[s.state] || C.VIGIL;
+  if (s.state === 'ANALYZE') prog = s.analyze_p;
+  if (s.state === 'BLESS')   prog = s.bless_p;
+  if (s.state === 'CENTER')  prog = s.center_p;
+  const pb = document.getElementById('progress-bar');
+  pb.style.width           = `${prog * 100}%`;
+  pb.style.background      = progCol;
+  pb.style.boxShadow       = `0 0 6px ${progCol}`;
+}
+
+setInterval(() => {
+  document.getElementById('hud-clock').textContent =
+    new Date().toTimeString().slice(0, 8);
+}, 500);
+
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onmessage = ({ data }) => {
+    try {
+      g = JSON.parse(data);
+      updateHUD();
+    } catch(_) {}
+  };
+  ws.onerror = () => ws.close();
+  ws.onclose = () => {
+    document.getElementById('hud-mode').textContent = 'SIGNAL LOST  //  RECONNECTING';
+    setTimeout(connect, 1500);
+  };
+}
+connect();
+
+// ── Operator keyboard shortcuts ───────────────────────────────────────────────
+function cmd(c) {
+  fetch('/command', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cmd: c }),
+  });
+}
+const ctrlPanel = document.getElementById('controls');
+document.addEventListener('keydown', e => {
+  if (e.key === 'c' || e.key === 'C')
+    ctrlPanel.style.display = ctrlPanel.style.display === 'flex' ? 'none' : 'flex';
+  if (e.key === 's') cmd('start');
+  if (e.key === 'Escape') cmd('stop');
+  if (e.key === 'b') cmd('bless');
+});
+</script>
+</body>
+</html>

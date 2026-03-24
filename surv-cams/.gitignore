@@ -4,10 +4,13 @@ input/
 reolinkapipy/
 sketch.md
 TODO.md
+example/
+server.tar
 
 # Models
 runs/
 yolov8n.pt
+*.engine
 
 # Python
 __pycache__
@@ -16,3 +19,5 @@ requiem/
 
 # Claude
 .claude/
+
+.gittoken

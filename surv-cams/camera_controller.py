@@ -9,6 +9,8 @@ Pan/tilt range limits are enforced via a time-based position estimator since
 the Reolink API provides no absolute position feedback.
 """
 
+from __future__ import annotations
+
 import threading
 import time
 import math
@@ -25,11 +27,11 @@ from reolinkapi import Camera
 # ──────────────────────────────────────────────────────────────────────────────
 
 # PTZ centering
-DEAD_ZONE_PX   = 45    # pixels from frame centre before issuing correction
+DEAD_ZONE_PX   = 70    # pixels from frame centre — wide enough to absorb YOLO jitter
 PAN_SPEED_MIN  = 8
 PAN_SPEED_MAX  = 30
-BURST_S        = 0.15  # how long each correction movement lasts before stopping
-INTER_BURST_S  = 0.35  # pause between bursts (camera settles, frame updates)
+BURST_S        = 0.25  # LAN HTTP round-trip ~50 ms; need ≥ 0.20 s for visible movement
+INTER_BURST_S  = 0.60  # longer settle → camera stops + new detection frame arrives
 
 # Zoom
 ZOOM_SPEED_TRACK = 22  # slow creep during ZOOM state
@@ -100,12 +102,24 @@ class CameraController:
         self._next_burst_at = 0.0     # earliest time the next burst may start
         self._burst_axis    = 'h'     # alternates 'h' (pan) / 'v' (tilt)
 
+        # PTZ serialisation lock — prevents concurrent HTTP calls racing on the
+        # camera connection or triggering simultaneous re-login attempts.
+        # All _ptz_bg() calls acquire this before touching the camera API.
+        self._ptz_lock = threading.Lock()
+
     # ─── Connection ──────────────────────────────────────────────────────────
 
     def connect(self) -> bool:
         print(f"[Camera] Connecting to {self.ip} ...")
         self._camera = Camera(self.ip, self.username, self.password, profile=self.profile)
-        print("[Camera] Connected.")
+        # Explicit login — some reolinkapi versions only log in lazily on first call,
+        # which can race with model loading and leave the token stale.
+        try:
+            self._camera.login()
+            time.sleep(0.5)   # give the camera a moment to activate the new token
+            print("[Camera] Connected and authenticated.")
+        except Exception as exc:
+            print(f"[Camera] Login error: {exc}")
         try:
             self._camera.set_osd(
                 osd_channel_enabled=False,
@@ -117,6 +131,94 @@ class CameraController:
         except Exception as exc:
             print(f"[Camera] Could not clear OSD: {exc}")
         return True
+
+    def _relogin(self) -> bool:
+        """Re-authenticate. Called automatically when rspCode -6 is detected."""
+        try:
+            self._camera.login()
+            print("[Camera] Re-login OK.")
+            return True
+        except Exception as exc:
+            print(f"[Camera] Re-login FAILED: {exc}")
+            return False
+
+    def _ptz_call_locked(self, fn, **kwargs):
+        """
+        Core PTZ HTTP call with auth-retry.  Caller must hold self._ptz_lock.
+        """
+        try:
+            rv = fn(**kwargs)
+        except Exception as exc:
+            print(f"[Camera] PTZ call error: {exc}")
+            return None
+
+        if isinstance(rv, list) and rv:
+            err = rv[0].get('error', {})
+            if err.get('rspCode') == -6:
+                print("[Camera] Session expired — re-logging in and retrying …")
+                if self._relogin():
+                    try:
+                        rv = fn(**kwargs)
+                    except Exception as exc:
+                        print(f"[Camera] PTZ retry error: {exc}")
+                        return None
+        return rv
+
+    def _ptz_call(self, fn, **kwargs):
+        """Synchronous PTZ call — blocks the caller until the HTTP round-trip completes.
+        Use for startup / one-shot operations (preset, zoom, test).
+        Do NOT call from the main engine loop."""
+        with self._ptz_lock:
+            return self._ptz_call_locked(fn, **kwargs)
+
+    def _ptz_bg(self, fn, **kwargs):
+        """Non-blocking PTZ call — returns immediately, executes in a daemon thread.
+        The _ptz_lock serialises concurrent calls so commands reach the camera in order
+        and re-login races are impossible.  Use for all move/stop commands in the
+        engine loop so the main thread never stalls on a camera HTTP round-trip."""
+        def _run():
+            with self._ptz_lock:
+                self._ptz_call_locked(fn, **kwargs)
+        threading.Thread(target=_run, daemon=True, name='ptz-bg').start()
+
+    def test_ptz(self) -> bool:
+        """
+        Send a small left-right nudge and confirm the camera responds.
+        Prints a clear PASS / FAIL message.
+
+        Returns True if the API accepted the command (code 0 in response).
+        Note: even PASS only means the API accepted the command — if the camera
+        has AI Tracking, Guard Position, or PTZ Patrol enabled it may still
+        override the movement.  Disable those features in the camera web UI.
+        """
+        import time as _time
+        print("[Camera] PTZ self-test: nudge left …")
+        try:
+            rv = self._ptz_call(self._camera.move_left, speed=20)
+            _time.sleep(0.30)
+            self._ptz_call(self._camera.stop_ptz)
+            # reolinkapi returns a list of response dicts; code 0 = success
+            ok = False
+            if isinstance(rv, list) and rv:
+                ok = rv[0].get('code', -1) == 0
+            elif isinstance(rv, bool):
+                ok = rv
+            elif rv is None:
+                ok = True   # older lib versions return None on success
+            if ok:
+                print("[Camera] PTZ self-test PASS — API accepted the command.")
+                print("[Camera] If the camera did NOT physically move, check:")
+                print("         • AI Smart Tracking → OFF")
+                print("         • Guard Position / Guard Tour → OFF")
+                print("         • PTZ Patrol → OFF")
+                print("         (All found in the camera's web UI under PTZ or AI settings)")
+            else:
+                print(f"[Camera] PTZ self-test FAIL — camera returned: {rv}")
+                print("[Camera] Possible causes: wrong password, locked PTZ, unsupported firmware.")
+            return ok
+        except Exception as exc:
+            print(f"[Camera] PTZ self-test ERROR: {exc}")
+            return False
 
     # ─── Streaming ───────────────────────────────────────────────────────────
 
@@ -148,11 +250,8 @@ class CameraController:
     def stop(self):
         self._stream_active = False
         if self._camera:
-            try:
-                self._camera.stop_ptz()
-                self._camera.stop_zooming()
-            except Exception:
-                pass
+            self._ptz_call(self._camera.stop_ptz)
+            self._ptz_call(self._camera.stop_zooming)
         print("[Camera] Stopped.")
 
     # ─── PTZ – patrol sweep ──────────────────────────────────────────────────
@@ -209,22 +308,35 @@ class CameraController:
             'LeftDown':  self._camera.move_left_down,
             'RightDown': self._camera.move_right_down,
         }
-        try:
-            op_map[direction](speed=speed)
-        except Exception as exc:
-            print(f"[Camera] Sweep command failed: {exc}")
+        self._ptz_call(op_map[direction], speed=speed)
 
         now = time.time()
         return now + duration, now + duration + pause
 
+    def is_moving(self) -> bool:
+        """True while a PTZ burst is in progress (camera is physically panning/tilting)."""
+        return self._burst_active
+
     def stop_movement(self):
-        try:
-            self._camera.stop_ptz()
-        except Exception:
-            pass
+        """Synchronous stop — use at state transitions where the camera must be
+        stationary before proceeding (e.g. entering CENTER after HUNT)."""
+        self._ptz_call(self._camera.stop_ptz)
         self._burst_active  = False
         self._next_burst_at = 0.0
         self._burst_axis    = 'h'
+
+    def stop_movement_async(self):
+        """Non-blocking stop — use inside the main engine loop (e.g. sweep leg ends)
+        so the engine thread does not stall on the HTTP round-trip."""
+        self._ptz_bg(self._camera.stop_ptz)
+        self._burst_active  = False
+        self._next_burst_at = 0.0
+        self._burst_axis    = 'h'
+
+    def start_pan(self, direction: str, speed: int = 20):
+        """Start continuous pan in 'left' or 'right'. Non-blocking."""
+        fn = self._camera.move_left if direction == 'left' else self._camera.move_right
+        self._ptz_bg(fn, speed=speed)
 
     # ─── PTZ – face centering ────────────────────────────────────────────────
 
@@ -249,12 +361,8 @@ class CameraController:
         dist = math.hypot(dx, dy)
 
         if dist < DEAD_ZONE_PX:
-            # Make sure any in-progress burst is stopped when we're centred
             if self._burst_active:
-                try:
-                    self._camera.stop_ptz()
-                except Exception:
-                    pass
+                self._ptz_bg(self._camera.stop_ptz)   # non-blocking
                 self._burst_active = False
             return 'centered'
 
@@ -263,26 +371,31 @@ class CameraController:
         # ── If a burst is in progress, check whether it's time to stop it ────
         if self._burst_active:
             if now >= self._burst_end:
-                try:
-                    self._camera.stop_ptz()
-                except Exception:
-                    pass
+                self._ptz_bg(self._camera.stop_ptz)    # non-blocking
                 self._burst_active  = False
                 self._next_burst_at = now + INTER_BURST_S
-                # Flip axis for next burst
-                self._burst_axis = 'v' if self._burst_axis == 'h' else 'h'
             return 'adjusting'
 
         # ── Inter-burst pause: camera settling / frame updating ───────────────
         if now < self._next_burst_at:
             return 'adjusting'
 
-        # ── Start the next burst on the current axis ──────────────────────────
+        # ── Pick axis: always correct the larger error; skip centred axes ─────
+        # This prevents wasting bursts on an axis that is already in dead zone.
+        h_needed = abs(dx) > DEAD_ZONE_PX
+        v_needed = abs(dy) > DEAD_ZONE_PX
+
+        if h_needed and v_needed:
+            self._burst_axis = 'h' if abs(dx) >= abs(dy) else 'v'
+        elif h_needed:
+            self._burst_axis = 'h'
+        elif v_needed:
+            self._burst_axis = 'v'
+        # else: both in dead zone — already handled by dist < DEAD_ZONE_PX above
+
         norm  = min(dist / (frame_w / 2), 1.0)
         speed = int(PAN_SPEED_MIN + norm * (PAN_SPEED_MAX - PAN_SPEED_MIN))
 
-        # Headroom is direction-sensitive: only block movement that would push
-        # FURTHER past the limit, never block movement back toward centre.
         pan_ok_right  = self._pan_pos  < self._pan_limit
         pan_ok_left   = self._pan_pos  > -self._pan_limit
         tilt_ok_down  = self._tilt_pos < self._tilt_down_limit
@@ -290,36 +403,36 @@ class CameraController:
 
         moved = False
         cmd   = None
-        try:
-            if self._burst_axis == 'h' and abs(dx) > DEAD_ZONE_PX:
-                if dx > 0 and pan_ok_right:
-                    self._camera.move_right(speed=speed)
-                    cmd = f"move_right  speed={speed}"
-                    delta = speed * BURST_S * DEG_PER_SPEED_PER_SEC
-                    self._pan_pos = min(self._pan_pos + delta,  self._pan_limit)
-                    moved = True
-                elif dx < 0 and pan_ok_left:
-                    self._camera.move_left(speed=speed)
-                    cmd = f"move_left   speed={speed}"
-                    delta = speed * BURST_S * DEG_PER_SPEED_PER_SEC
-                    self._pan_pos = max(self._pan_pos - delta, -self._pan_limit)
-                    moved = True
-
-            elif self._burst_axis == 'v' and abs(dy) > DEAD_ZONE_PX:
-                if dy > 0 and tilt_ok_down:
-                    self._camera.move_down(speed=speed)
-                    cmd = f"move_down   speed={speed}"
-                    delta = speed * BURST_S * DEG_PER_SPEED_PER_SEC
-                    self._tilt_pos = min(self._tilt_pos + delta,  self._tilt_down_limit)
-                    moved = True
-                elif dy < 0 and tilt_ok_up:
-                    self._camera.move_up(speed=speed)
-                    cmd = f"move_up     speed={speed}"
-                    delta = speed * BURST_S * DEG_PER_SPEED_PER_SEC
-                    self._tilt_pos = max(self._tilt_pos - delta, -self._tilt_up_limit)
-                    moved = True
-        except Exception as exc:
-            print(f"[Camera] PTZ error: {exc}")
+        if self._burst_axis == 'h':
+            if dx > 0 and pan_ok_right:
+                self._ptz_bg(self._camera.move_right, speed=speed)
+                cmd = f"move_right  speed={speed}"
+                self._pan_pos = min(
+                    self._pan_pos + speed * BURST_S * DEG_PER_SPEED_PER_SEC,
+                    self._pan_limit)
+                moved = True
+            elif dx < 0 and pan_ok_left:
+                self._ptz_bg(self._camera.move_left, speed=speed)
+                cmd = f"move_left   speed={speed}"
+                self._pan_pos = max(
+                    self._pan_pos - speed * BURST_S * DEG_PER_SPEED_PER_SEC,
+                    -self._pan_limit)
+                moved = True
+        else:  # 'v'
+            if dy > 0 and tilt_ok_down:
+                self._ptz_bg(self._camera.move_down, speed=speed)
+                cmd = f"move_down   speed={speed}"
+                self._tilt_pos = min(
+                    self._tilt_pos + speed * BURST_S * DEG_PER_SPEED_PER_SEC,
+                    self._tilt_down_limit)
+                moved = True
+            elif dy < 0 and tilt_ok_up:
+                self._ptz_bg(self._camera.move_up, speed=speed)
+                cmd = f"move_up     speed={speed}"
+                self._tilt_pos = max(
+                    self._tilt_pos - speed * BURST_S * DEG_PER_SPEED_PER_SEC,
+                    -self._tilt_up_limit)
+                moved = True
 
         print(f"[Center] axis={self._burst_axis}  dx={dx:+.0f}  dy={dy:+.0f}  "
               f"pan_pos={self._pan_pos:+.1f}  tilt_pos={self._tilt_pos:+.1f}  "
@@ -329,7 +442,7 @@ class CameraController:
             self._burst_active = True
             self._burst_end    = now + BURST_S
         else:
-            # Current axis already in dead zone — skip to other axis immediately
+            # Movement blocked by position limit — try other axis, short wait
             self._burst_axis    = 'v' if self._burst_axis == 'h' else 'h'
             self._next_burst_at = now + INTER_BURST_S
 
@@ -338,35 +451,24 @@ class CameraController:
     # ─── Zoom ─────────────────────────────────────────────────────────────────
 
     def zoom_in_slow(self):
-        try:
-            self._camera.start_zooming_in(speed=ZOOM_SPEED_TRACK)
-        except Exception:
-            pass
+        self._ptz_call(self._camera.start_zooming_in, speed=ZOOM_SPEED_TRACK)
 
     def zoom_out_full(self):
-        try:
-            self._camera.start_zooming_out(speed=ZOOM_SPEED_RESET)
-        except Exception:
-            pass
+        self._ptz_call(self._camera.start_zooming_out, speed=ZOOM_SPEED_RESET)
 
     def zoom_to_minimum(self):
         """Absolute zoom-out via StartZoomFocus; falls back to continuous out."""
-        try:
-            self._camera.start_zoom_pos(0)
-        except Exception:
+        fn = getattr(self._camera, 'start_zoom_pos', None)
+        if fn is None or self._ptz_call(fn, 0) is None:
             self.zoom_out_full()
 
     def stop_zoom(self):
-        try:
-            self._camera.stop_zooming()
-        except Exception:
-            pass
+        self._ptz_call(self._camera.stop_zooming)
 
     def go_to_preset(self, index: int = 1, speed: int = 60):
-        try:
-            self._camera.go_to_preset(speed=speed, index=index)
-        except Exception:
-            pass
+        print(f"[Camera] go_to_preset index={index} speed={speed}")
+        rv = self._ptz_call(self._camera.go_to_preset, speed=speed, index=index)
+        print(f"[Camera] go_to_preset response: {rv}")
 
     # ─── Utility ─────────────────────────────────────────────────────────────
 
