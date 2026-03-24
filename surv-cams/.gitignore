@@ -1,0 +1,18 @@
+# Folders and Files
+archive/
+input/
+reolinkapipy/
+sketch.md
+TODO.md
+
+# Models
+runs/
+yolov8n.pt
+
+# Python
+__pycache__
+requiem/ 
+
+
+# Claude
+.claude/
