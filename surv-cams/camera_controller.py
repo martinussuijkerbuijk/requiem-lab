@@ -101,6 +101,7 @@ class CameraController:
         self._burst_end     = 0.0     # time.time() when to stop the current burst
         self._next_burst_at = 0.0     # earliest time the next burst may start
         self._burst_axis    = 'h'     # alternates 'h' (pan) / 'v' (tilt)
+        self._panning       = False   # True while a hunt sweep pan is active
 
         # PTZ serialisation lock — prevents concurrent HTTP calls racing on the
         # camera connection or triggering simultaneous re-login attempts.
@@ -314,8 +315,8 @@ class CameraController:
         return now + duration, now + duration + pause
 
     def is_moving(self) -> bool:
-        """True while a PTZ burst is in progress (camera is physically panning/tilting)."""
-        return self._burst_active
+        """True while a centering burst OR a hunt sweep pan is in progress."""
+        return self._burst_active or self._panning
 
     def stop_movement(self):
         """Synchronous stop — use at state transitions where the camera must be
@@ -324,6 +325,7 @@ class CameraController:
         self._burst_active  = False
         self._next_burst_at = 0.0
         self._burst_axis    = 'h'
+        self._panning       = False
 
     def stop_movement_async(self):
         """Non-blocking stop — use inside the main engine loop (e.g. sweep leg ends)
@@ -332,10 +334,12 @@ class CameraController:
         self._burst_active  = False
         self._next_burst_at = 0.0
         self._burst_axis    = 'h'
+        self._panning       = False
 
     def start_pan(self, direction: str, speed: int = 20):
         """Start continuous pan in 'left' or 'right'. Non-blocking."""
         fn = self._camera.move_left if direction == 'left' else self._camera.move_right
+        self._panning = True
         self._ptz_bg(fn, speed=speed)
 
     # ─── PTZ – face centering ────────────────────────────────────────────────
@@ -469,6 +473,58 @@ class CameraController:
         print(f"[Camera] go_to_preset index={index} speed={speed}")
         rv = self._ptz_call(self._camera.go_to_preset, speed=speed, index=index)
         print(f"[Camera] go_to_preset response: {rv}")
+
+    # ─── Lights ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _light_status(rv) -> str:
+        """Extract a short OK/ERR summary from a camera light API response."""
+        try:
+            code = rv[0].get("code", "?") if isinstance(rv, list) else "?"
+            return "OK" if str(code) == "0" else f"ERR code={code}"
+        except Exception:
+            return f"ERR {rv}"
+
+    def set_ir_lights(self, state: str = "Auto"):
+        """Control IR LEDs.  state: 'Auto' | 'Off'"""
+        body = [{"cmd": "SetIrLights", "action": 0,
+                 "param": {"IrLights": {"channel": 0, "state": state}}}]
+        try:
+            rv = self._camera._execute_command("SetIrLights", body)
+            print(f"[Lights] IR={state}  {self._light_status(rv)}")
+        except Exception as e:
+            print(f"[Lights] IR={state}  ERR {e}")
+
+    def set_white_led(self, on: bool, bright: int = 100):
+        """Control white spotlight.  on=True turns it on at given brightness (0-100)."""
+        # mode 0 = off/disabled, mode 1 = always-on when state=1.
+        # When turning off, force mode=0 so the firmware doesn't auto-reactivate.
+        body = [{"cmd": "SetWhiteLed", "action": 0,
+                 "param": {"WhiteLed": {"channel": 0, "state": int(on),
+                                        "bright": bright if on else 0,
+                                        "mode": 1 if on else 0}}}]
+        try:
+            rv = self._camera._execute_command("SetWhiteLed", body)
+            label = f"ON bright={bright}%" if on else "OFF"
+            print(f"[Lights] white={label}  {self._light_status(rv)}")
+        except Exception as e:
+            print(f"[Lights] white={'ON' if on else 'OFF'}  ERR {e}")
+
+    def all_lights_off(self):
+        """Turn off both IR and white LED in a single request so the firmware
+        cannot auto-switch between them when IR is disabled."""
+        body = [
+            {"cmd": "SetIrLights", "action": 0,
+             "param": {"IrLights": {"channel": 0, "state": "Off"}}},
+            {"cmd": "SetWhiteLed", "action": 0,
+             "param": {"WhiteLed": {"channel": 0, "state": 0,
+                                    "bright": 0, "mode": 0}}},
+        ]
+        try:
+            rv = self._camera._execute_command("SetIrLights", body, multi=True)
+            print(f"[Lights] IR=Off white=OFF  {self._light_status(rv)}")
+        except Exception as e:
+            print(f"[Lights] IR=Off white=OFF  ERR {e}")
 
     # ─── Utility ─────────────────────────────────────────────────────────────
 

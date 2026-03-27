@@ -54,22 +54,29 @@ except Exception as _cam_import_err:
 # ── Timing (mirrors requiem.py) ───────────────────────────────────────────────
 
 CENTER_TIMEOUT     = 15.0
-CENTER_LOST_S      = 3.0
+CENTER_LOST_S      = 5.0   # raised from 3.0 — camera needs ~1.5s to settle after sweep
 DEAD_ZONE_PX       = 70    # must match camera_controller.DEAD_ZONE_PX
 CENTER_HOLD_N      = 3     # consecutive centered reads required before committing to ZOOM
 ZOOM_TIMEOUT       = 20.0
 ZOOM_LOST_S        = 4.0
-ANALYZE_DURATION   = 7.0
-BLESS_DURATION     = 5.0
+ANALYZE_DURATION   = 15.0   # raised — audience needs time to read the analysis
+BLESS_DURATION     = 10.0   # raised — give the blessing ritual space to breathe
 ZOOM_OUT_DURATION  = 3.0
 DETECT_EVERY_N     = 4
 ZOOM_STEP          = 0.010
 MAX_DIGITAL_ZOOM   = 2.5
 
+# Processing resolution — frames are downscaled to this immediately after
+# acquisition.  YOLO, MediaPipe, digital zoom, and MJPEG encoding all run
+# on this size.  Keeps CPU/GPU load proportional to a 1280-wide frame
+# regardless of whether the camera outputs 1080p or 4K.
+PROC_W = 1280
+PROC_H = 720
+
 # HUNT systematic sweep (2 full 60° sweeps before face locking)
 # At HUNT_SWEEP_SPEED PTZ units and DEG_PER_SPEED_PER_SEC=1.0 → speed=deg/s
-HUNT_SWEEP_SPEED  = 20     # PTZ speed passed to move_left/move_right
-HUNT_SWEEP_HALF_T = 1.5    # seconds per 30° half-arc (30 / 20 deg·s⁻¹)
+HUNT_SWEEP_SPEED  = 8     # PTZ speed passed to move_left/move_right
+HUNT_SWEEP_HALF_T = 3.5    # seconds per 30° half-arc (30 / 20 deg·s⁻¹)
 HUNT_DETECT_T     = 5.0    # seconds to wait for a face after sweep before re-sweeping
 
 # Legs: (direction, duration_s)  —  two full sweeps + return to centre
@@ -193,15 +200,19 @@ class RequiemEngine:
         self.yolo = YOLO(path)
         if cuda_ok:
             self.yolo.to('cuda')
-            # Warmup: CUDA kernel JIT-compiles on the first inference.
-            # Running a dummy frame now means the first real frame isn't slow.
-            dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+            # Warmup at the actual processing resolution so CUDA kernels for
+            # that input size are compiled before the first real frame.
+            dummy = np.zeros((PROC_H, PROC_W, 3), dtype=np.uint8)
             self.yolo(dummy, verbose=False)
             print("[Requiem] YOLO warmed up on CUDA.")
         print("[Requiem] Loading MediaPipe …")
         self.face_mesh = mp.solutions.face_mesh.FaceMesh(
             max_num_faces=10, refine_landmarks=True,
-            min_detection_confidence=0.5, min_tracking_confidence=0.5)
+            min_detection_confidence=0.3, min_tracking_confidence=0.3)
+        # CLAHE for grayscale/IR camera frames — MediaPipe was trained on
+        # colour images; enhancing local contrast helps the face detector fire
+        # on monochrome surveillance footage.
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         print("[Requiem] Models ready.")
 
     def connect_camera(self):
@@ -240,6 +251,9 @@ class RequiemEngine:
         print("[Requiem] Camera live.")
         if self._cam:
             self._cam.test_ptz()
+            # Always kill both lights at startup — sent as one atomic request so
+            # the firmware cannot auto-switch to white LED when IR is disabled.
+            self._cam.all_lights_off()
 
     # ── Frame source ──────────────────────────────────────────────────────────
 
@@ -254,12 +268,18 @@ class RequiemEngine:
     _detect_count = 0
     _detect_total_ms = 0.0
 
-    def _detect(self, frame: np.ndarray) -> list[tuple]:
+    # Minimum face dimension in pixels — rejects tiny false positives on
+    # headrests/backgrounds that are too small to be a real face at this range.
+    _MIN_FACE_PX = 45
+
+    def _detect(self, frame: np.ndarray, conf: float = 0.45) -> list[tuple]:
         t0 = time.time()
         boxes = []
-        for r in self.yolo(frame, verbose=False, conf=0.45, stream=True, half=True):
+        for r in self.yolo(frame, verbose=False, conf=conf, stream=True, half=True):
             for box in r.boxes:
-                boxes.append(tuple(box.xyxy[0].cpu().numpy().astype(int)))
+                b = tuple(box.xyxy[0].cpu().numpy().astype(int))
+                if (b[2] - b[0]) >= self._MIN_FACE_PX and (b[3] - b[1]) >= self._MIN_FACE_PX:
+                    boxes.append(b)
         ms = (time.time() - t0) * 1000
         RequiemEngine._detect_count += 1
         RequiemEngine._detect_total_ms += ms
@@ -268,8 +288,39 @@ class RequiemEngine:
             print(f"[YOLO] last={ms:.0f}ms  avg={avg:.0f}ms  calls={RequiemEngine._detect_count}")
         return boxes
 
+    # Maximum pixel width fed to MediaPipe — checked against the actual input
+    # frame dimensions (not the output coordinate space w, h).
+    _MP_MAX_W = 960
+
     def _run_mediapipe(self, frame: np.ndarray, w: int, h: int) -> list[dict]:
-        rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # w, h are the OUTPUT coordinate space (zoomed frame dimensions).
+        # Resize based on the ACTUAL input pixel width, not w.
+        fw = frame.shape[1]
+        if fw > self._MP_MAX_W:
+            scale = self._MP_MAX_W / fw
+            fh    = frame.shape[0]
+            small = cv2.resize(frame, (self._MP_MAX_W, int(fh * scale)),
+                               interpolation=cv2.INTER_LINEAR)
+        else:
+            small = frame
+
+        # IR/B&W cameras produce grayscale frames (R≈G≈B).  MediaPipe was
+        # trained on colour images — BlazeFace fires poorly on flat monochrome.
+        # Detect IR mode via --ir flag OR automatically by checking colour
+        # variance.  Fix: apply CLAHE to boost local contrast so the face
+        # detector can find edges and landmarks.
+        force_ir = getattr(self._args, 'ir', False)
+        if force_ir:
+            is_ir = True
+        else:
+            b_ch, _, r_ch = cv2.split(small)
+            is_ir = float(np.std(r_ch.astype(np.int16) - b_ch.astype(np.int16))) < 8.0
+        if is_ir:
+            gray     = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            enhanced = self._clahe.apply(gray)
+            small    = cv2.merge([enhanced, enhanced, enhanced])
+
+        rgb     = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(rgb)
         out = []
         if not results.multi_face_landmarks:
@@ -314,6 +365,14 @@ class RequiemEngine:
         print(f"[Requiem] {self.state.value} → {s.value}")
         self.state = s
         self._state_entered_at = time.time()
+        if self._cam and getattr(self._args, 'spotlight', False):
+            if s in (State.ANALYZE, State.BLESS):
+                print(f"[Lights] {s.value} → spotlight ON  (IR off, white 100%)")
+                self._cam.set_ir_lights("Off")
+                self._cam.set_white_led(True, bright=100)
+            elif s in (State.HUNT, State.VIGIL):
+                print(f"[Lights] {s.value} → all off")
+                self._cam.all_lights_off()
 
     def _start_hunt(self):
         if self._cam:
@@ -411,16 +470,32 @@ class RequiemEngine:
                 time.sleep(0.03)
                 continue
 
-            h, w = frame.shape[:2]
+            # Downscale to processing resolution immediately — YOLO, MediaPipe,
+            # digital zoom, and MJPEG encoding all work on this smaller frame.
+            fh, fw = frame.shape[:2]
+            if fw != PROC_W or fh != PROC_H:
+                frame = cv2.resize(frame, (PROC_W, PROC_H),
+                                   interpolation=cv2.INTER_LINEAR)
+
+            h, w = frame.shape[:2]   # now always PROC_H × PROC_W
+
+            # Keep the unzoomed frame for MediaPipe — digital zoom enlarges the
+            # face too much and BlazeFace misses oversized faces.  We'll extract
+            # just the crop region that the zoom would show and run mesh on that.
+            pre_zoom_frame = frame
 
             # ── VIGIL ─────────────────────────────────────────────────────────
             if self.state == State.VIGIL:
-                pass
+                # Keep detection running so boxes appear immediately when
+                # the audience is watching before a hunt cycle starts.
+                if run_detect:
+                    self._detected = self._detect(frame)
 
             # ── HUNT ──────────────────────────────────────────────────────────
             elif self.state == State.HUNT:
                 if run_detect:
-                    self._detected = self._detect(frame)
+                    # Lower confidence during sweep — motion blur reduces YOLO certainty
+                    self._detected = self._detect(frame, conf=0.30)
 
                 if self._cam:
                     # ── Systematic 2-sweep patrol ─────────────────────────────
@@ -495,12 +570,17 @@ class RequiemEngine:
                     faces = self._detect(frame)
                     self._detected = faces   # keep browser display current
 
+                    if self._target is None and not faces:
+                        # Haven't locked anything yet — don't start the lost-timer
+                        # until we've had at least one successful detection.
+                        self._last_seen = now
+
                     if faces:
                         if self._target is None:
                             # No target yet (e.g. first frame after sweep) — pick
                             # a face from the current live frame so coordinates are fresh.
                             self._lock_target(self._pick(faces), now)
-                            print(f"[Center] locked fresh target from live detection")
+                            print(f"[Center] locked fresh target  faces_in_frame={len(faces)}")
                         else:
                             anchor_cx = float(self._target_centroid[0]) if self._target_centroid \
                                         else (self._target[0] + self._target[2]) / 2.0
@@ -550,6 +630,11 @@ class RequiemEngine:
                                     )
 
                 if (now - self._last_seen) > CENTER_LOST_S or elapsed > CENTER_TIMEOUT:
+                    reason = "timeout" if elapsed > CENTER_TIMEOUT else "lost"
+                    print(f"[Center] → HUNT ({reason})  "
+                          f"last_seen_age={now-self._last_seen:.1f}s  "
+                          f"elapsed={elapsed:.1f}s  "
+                          f"target={'set' if self._target else 'None'}")
                     self._start_hunt()
                     continue
 
@@ -603,6 +688,16 @@ class RequiemEngine:
                                                                  (f[1]+f[3])/2 - self._zoom_cy))
                             self._zoom_cx = int(self._zoom_cx * 0.9 + (best[0]+best[2])/2 * 0.1)
                             self._zoom_cy = int(self._zoom_cy * 0.9 + (best[1]+best[3])/2 * 0.1)
+                            # Keep _target in sync with zoom anchor so that _ibox
+                            # transforms it to the correct position in ANALYZE/BLESS.
+                            bw = best[2] - best[0]
+                            bh = best[3] - best[1]
+                            self._target = (
+                                int(self._zoom_cx - bw / 2),
+                                int(self._zoom_cy - bh / 2),
+                                int(self._zoom_cx + bw / 2),
+                                int(self._zoom_cy + bh / 2),
+                            )
 
                 if (now - self._last_seen) > ZOOM_LOST_S:
                     if self._cam:
@@ -632,9 +727,13 @@ class RequiemEngine:
 
             # ── BLESS ─────────────────────────────────────────────────────────
             elif self.state == State.BLESS:
-                frame = _digital_zoom(frame, MAX_DIGITAL_ZOOM, self._zoom_cx, self._zoom_cy)
                 if run_detect:
-                    self._detected = self._detect(frame)
+                    # Detect on the pre-zoom frame so YOLO returns pre-zoom
+                    # coordinates — _ibox will then map them to display space.
+                    # (Running detect on the already-zoomed frame would produce
+                    # coords that _ibox double-transforms to wrong positions.)
+                    self._detected = self._detect(pre_zoom_frame)
+                frame = _digital_zoom(frame, MAX_DIGITAL_ZOOM, self._zoom_cx, self._zoom_cy)
 
                 if elapsed >= BLESS_DURATION:
                     entry = {
@@ -653,12 +752,84 @@ class RequiemEngine:
 
             # ── Build snapshot ────────────────────────────────────────────────
             needs_mesh = self.state in (State.ZOOM, State.ANALYZE, State.BLESS)
-            mp_faces   = self._run_mediapipe(frame, w, h) if needs_mesh else []
+            mp_faces   = []
+            if needs_mesh:
+                if self._zoom_factor > 1.0 and self._zoom_cx and self._zoom_cy:
+                    # Extract the same crop region that _digital_zoom shows.
+                    # Running MediaPipe on this crop avoids the "face too large"
+                    # failure that occurs on the zoomed full frame.
+                    # Landmarks (p.x * w, p.y * h) land in zoomed-frame space
+                    # because the crop IS exactly what the zoomed frame displays.
+                    _zf  = self._zoom_factor
+                    _cw  = max(1, int(w / _zf))
+                    _ch  = max(1, int(h / _zf))
+                    _x1  = max(0, min(self._zoom_cx - _cw // 2, w - _cw))
+                    _y1  = max(0, min(self._zoom_cy - _ch // 2, h - _ch))
+                    # np array slices are non-contiguous views; MediaPipe
+                    # needs a contiguous buffer.
+                    crop = np.ascontiguousarray(
+                        pre_zoom_frame[_y1:_y1 + _ch, _x1:_x1 + _cw])
+                    mp_faces = self._run_mediapipe(crop, w, h)
+
+                    # Debug: save crop when at full zoom so we see what
+                    # MediaPipe actually receives (not the near-full-frame
+                    # at low zoom_factor which fires first otherwise).
+                    if (not mp_faces and self._detected and _zf >= 2.0
+                            and not getattr(self, '_mp_debug_saved', False)):
+                        cv2.imwrite('/tmp/mp_debug_crop.jpg', crop)
+                        print(f"[Mesh] DEBUG: mp_faces=0  YOLO found face  "
+                              f"crop_shape={crop.shape}  "
+                              f"x1={_x1} y1={_y1} cw={_cw} ch={_ch}  "
+                              f"zoom_factor={_zf:.2f}  "
+                              f"saved /tmp/mp_debug_crop.jpg")
+                        self._mp_debug_saved = True
+                else:
+                    mp_faces = self._run_mediapipe(frame, w, h)
+
+                if self._frame_count % 30 == 0:
+                    print(f"[Mesh] state={self.state.value}  mp_faces={len(mp_faces)}"
+                          f"  zoom_cx={self._zoom_cx}  zoom_cy={self._zoom_cy}"
+                          f"  zoom_factor={self._zoom_factor:.2f}")
 
             cp = 0.0  # no hold phase — center_p is unused now but kept for API compat
 
-            def _ibox(b):
-                return [int(b[0]), int(b[1]), int(b[2]), int(b[3])]
+            # ── Coordinate transform: pre-zoom → zoomed display space ──────────
+            # YOLO detections and the target bbox are in the pre-zoom 1280×720
+            # frame.  In ZOOM/ANALYZE/BLESS the MJPEG shows the zoomed crop, so
+            # we must map those coords before sending them to the browser.
+            # MediaPipe landmarks use the crop as input and p.x*w as output, so
+            # they are already in zoomed display space — no transform needed.
+            in_zoom = (self.state in (State.ZOOM, State.ANALYZE, State.BLESS)
+                       and self._zoom_factor > 1.0
+                       and self._zoom_cx and self._zoom_cy)
+
+            if in_zoom:
+                _zf   = self._zoom_factor
+                _cw_z = max(1, int(w / _zf))
+                _ch_z = max(1, int(h / _zf))
+                _xo   = max(0, min(self._zoom_cx - _cw_z // 2, w - _cw_z))
+                _yo   = max(0, min(self._zoom_cy - _ch_z // 2, h - _ch_z))
+
+                def _ibox(b):
+                    return [int((b[0] - _xo) * _zf), int((b[1] - _yo) * _zf),
+                            int((b[2] - _xo) * _zf), int((b[3] - _yo) * _zf)]
+
+                # Always keep only the MediaPipe face closest to display centre.
+                # This handles both multi-face false detections AND single
+                # detections on wrong objects (headrests, background figures).
+                # Reject outright if the closest face is >40% of frame width
+                # away from centre — it's not the zoomed subject.
+                if mp_faces:
+                    def _mp_dist(f):
+                        if f.get('lm_left_eye'):
+                            lx, ly = f['lm_left_eye'][0]
+                            return math.hypot(lx - w / 2, ly - h / 2)
+                        return float('inf')
+                    closest = min(mp_faces, key=_mp_dist)
+                    mp_faces = [closest] if _mp_dist(closest) < w * 0.40 else []
+            else:
+                def _ibox(b):
+                    return [int(b[0]), int(b[1]), int(b[2]), int(b[3])]
 
             tbox = _ibox(self._target) if self._target is not None else None
 
@@ -832,6 +1003,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--stream-height', default=480, type=int,
                    help='Height of MJPEG stream sent to browser')
     p.add_argument('--start',       action='store_true', help='Begin HUNT on launch')
+    p.add_argument('--ir',          action='store_true',
+                   help='Force CLAHE enhancement for IR/B&W camera mode. '
+                        'Auto-detected when omitted (uses colour-variance check).')
+    p.add_argument('--spotlight',   action='store_true',
+                   help='Enable white spotlight during ANALYZE/BLESS. '
+                        'Turns IR off and white LED on when the subject is analysed, '
+                        'restores IR Auto when returning to HUNT/VIGIL. '
+                        'Requires a camera with a physical white LED.')
     return p.parse_args()
 
 

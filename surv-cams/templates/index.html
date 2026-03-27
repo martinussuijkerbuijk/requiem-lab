@@ -64,8 +64,8 @@ body.vigil  #feed { filter: grayscale(1) brightness(0.6) sepia(0.4) hue-rotate(2
   inset: 0;
   background: repeating-linear-gradient(
     to bottom,
-    transparent 0px, transparent 3px,
-    rgba(0,0,0,0.11) 3px, rgba(0,0,0,0.11) 4px
+    transparent 0px, transparent 4px,
+    rgba(0,0,0,0.2) 4px, rgba(0,0,0,0.2) 5px
   );
   pointer-events: none;
 }
@@ -82,7 +82,7 @@ body.vigil  #feed { filter: grayscale(1) brightness(0.6) sepia(0.4) hue-rotate(2
 .hud {
   position: absolute;
   font-family: 'Courier New', Courier, monospace;
-  font-size: 11px;
+  font-size: 14px;
   line-height: 1.8;
   letter-spacing: 0.07em;
   color: #00ff41;
@@ -215,6 +215,9 @@ let g = {
   blessed_n: 0, last_psych: 'COMPLIANT',
 };
 
+// Cache the last known face analysis so BLESS can keep showing it
+let _lastAnalysisFaces = [];
+
 // ── Scale: map frame coords → canvas coords ───────────────────────────────────
 // Frame dimensions may differ from 1280×720 but canvas is always 1280×720.
 function sx(x) { return x * W / (g.frame_w || W); }
@@ -256,7 +259,7 @@ function noGlow()           { ctx.shadowBlur = 0; }
 
 function brackets(x1, y1, x2, y2, color, arm, lineW, glowBlur) {
   arm      = arm      ?? 26;
-  lineW    = lineW    ?? 1.8;
+  lineW    = lineW    ?? 2.2;
   glowBlur = glowBlur ?? 10;
   ctx.save();
   ctx.strokeStyle = color;
@@ -434,16 +437,17 @@ function drawScale(x, cy, vals, hiIdx, color, right) {
 const particles = [];
 let _lastSpawn  = 0;
 
-function spawnParticles(cx, cy, color) {
-  for (let i = 0; i < 7; i++) {
+function spawnParticles(cx, cy, color, n) {
+  n = n ?? 3;
+  for (let i = 0; i < n; i++) {
     particles.push({
-      x: cx + (Math.random() - 0.5) * 80,
-      y: cy,
-      vx: (Math.random() - 0.5) * 1.5,
-      vy: -(0.8 + Math.random() * 2),
+      x: cx + (Math.random() - 0.5) * 12,
+      y: cy + (Math.random() - 0.5) * 12,
+      vx: (Math.random() - 0.5) * 2.5,
+      vy: (Math.random() - 0.5) * 2.5,
       life: 1.0,
-      decay: 0.011 + Math.random() * 0.009,
-      size: 1.5 + Math.random() * 2,
+      decay: 0.025 + Math.random() * 0.02,
+      size: 1.0 + Math.random() * 1.5,
       color,
     });
   }
@@ -487,18 +491,27 @@ function render(ts) {
   const cx_mid = W / 2, cy_mid = H / 2;
 
   // ── VIGIL / all states: frame crosshair ───────────────────────────────────
-  const chAlpha = g.state === 'VIGIL'  ? 0.5 + 0.4 * Math.abs(Math.sin(t * 1.4)) :
-                  g.state === 'CENTER' ? 0.9 : 0.18;
+  const chAlpha = g.state === 'VIGIL'  ? 0.75 + 0.25 * Math.abs(Math.sin(t * 1.4)) :
+                  g.state === 'CENTER' ? 1.0 : 0.35;
   ctx.globalAlpha = chAlpha;
   crosshair(cx_mid, cy_mid, 30, color);
   ctx.globalAlpha = 1;
+
+  // ── VIGIL: show detected faces so the audience sees the camera is watching ──
+  if (g.state === 'VIGIL') {
+    g.faces.forEach(f => {
+      ctx.globalAlpha = 1.0;
+      brackets(sx(f.bbox[0]), sy(f.bbox[1]), sx(f.bbox[2]), sy(f.bbox[3]), color, 20, 2.5, 14);
+      ctx.globalAlpha = 1;
+    });
+  }
 
   // ── HUNT ──────────────────────────────────────────────────────────────────
   if (g.state === 'HUNT') {
     g.faces.forEach(f => {
       const [x1, y1, x2, y2] = f.bbox.map ? f.bbox : [f.bbox[0],f.bbox[1],f.bbox[2],f.bbox[3]];
-      ctx.globalAlpha = f.is_target ? 0.9 : 0.35;
-      brackets(sx(x1), sy(y1), sx(x2), sy(y2), color, 22, 1.5, f.is_target ? 8 : 0);
+      ctx.globalAlpha = 1.0;
+      brackets(sx(x1), sy(y1), sx(x2), sy(y2), color, 24, 2.5, f.is_target ? 16 : 10);
       ctx.globalAlpha = 1;
     });
 
@@ -507,12 +520,12 @@ function render(ts) {
     const angle = (t * 1.3) % (Math.PI * 2);
     ctx.save();
     ctx.strokeStyle = color;
-    ctx.globalAlpha = 0.4;
-    ctx.lineWidth   = 1;
-    ctx.beginPath(); ctx.arc(ox, oy, r, 0, Math.PI * 2); ctx.stroke();
     ctx.globalAlpha = 0.7;
-    glow(color, 8);
-    ctx.lineWidth = 1.2;
+    ctx.lineWidth   = 1.5;
+    ctx.beginPath(); ctx.arc(ox, oy, r, 0, Math.PI * 2); ctx.stroke();
+    ctx.globalAlpha = 0.9;
+    glow(color, 10);
+    ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(ox, oy);
     ctx.lineTo(ox + r * Math.cos(angle), oy + r * Math.sin(angle));
@@ -521,26 +534,28 @@ function render(ts) {
   }
 
   // ── CENTER ────────────────────────────────────────────────────────────────
-  if (g.state === 'CENTER' && g.target) {
-    const [x1, y1, x2, y2] = g.target;
-    const cx1 = sx(x1), cy1 = sy(y1), cx2 = sx(x2), cy2 = sy(y2);
-    const arm = 20 + 10 * Math.abs(Math.sin(t * 7));
-    const lw  = 1.5 + Math.abs(Math.sin(t * 7));
-    brackets(cx1, cy1, cx2, cy2, color, arm, lw, 10);
-
-    const fcx = (cx1 + cx2) / 2, fcy = (cy1 + cy2) / 2;
-    dashedLine(fcx, fcy, cx_mid, cy_mid, color, t);
-
-    const faceW = cx2 - cx1;
-    arcProgress(fcx, fcy, faceW * 0.6, g.center_p, color);
-
-    // Ghost boxes for other faces
+  if (g.state === 'CENTER') {
+    // Always draw any detected faces (visible even before target is locked)
     g.faces.forEach(f => {
       if (f.is_target) return;
-      ctx.globalAlpha = 0.2;
-      brackets(sx(f.bbox[0]), sy(f.bbox[1]), sx(f.bbox[2]), sy(f.bbox[3]), color, 14, 0.8, 0);
+      ctx.globalAlpha = 0.55;
+      brackets(sx(f.bbox[0]), sy(f.bbox[1]), sx(f.bbox[2]), sy(f.bbox[3]), color, 14, 1.5, 4);
       ctx.globalAlpha = 1;
     });
+
+    if (g.target) {
+      const [x1, y1, x2, y2] = g.target;
+      const cx1 = sx(x1), cy1 = sy(y1), cx2 = sx(x2), cy2 = sy(y2);
+      const arm = 20 + 10 * Math.abs(Math.sin(t * 7));
+      const lw  = 2.0 + Math.abs(Math.sin(t * 7));
+      brackets(cx1, cy1, cx2, cy2, color, arm, lw, 14);
+
+      const fcx = (cx1 + cx2) / 2, fcy = (cy1 + cy2) / 2;
+      dashedLine(fcx, fcy, cx_mid, cy_mid, color, t);
+
+      const faceW = cx2 - cx1;
+      arcProgress(fcx, fcy, faceW * 0.6, g.center_p, color);
+    }
   }
 
   // ── ZOOM / ANALYZE ────────────────────────────────────────────────────────
@@ -549,24 +564,24 @@ function render(ts) {
 
     if (g.target) {
       brackets(sx(g.target[0]), sy(g.target[1]), sx(g.target[2]), sy(g.target[3]),
-               color, 24, 1.5, 6);
+               color, 24, 2.2, 10);
     }
 
     g.mp_faces.forEach(f => {
       const scaleP = p => [sx(p[0]), sy(p[1])];
-      polyline(f.lm_left_eye.map(scaleP),  C.eye, 1.5);
-      polyline(f.lm_right_eye.map(scaleP), C.eye, 1.5);
-      polyline(f.lm_lips.map(scaleP),      C.lip, 1.5);
+      polyline(f.lm_left_eye.map(scaleP),  C.eye, 2.2);
+      polyline(f.lm_right_eye.map(scaleP), C.eye, 2.2);
+      polyline(f.lm_lips.map(scaleP),      C.lip, 2.2);
       if (f.lm_left_iris)  crosshair(sx(f.lm_left_iris[0]),  sy(f.lm_left_iris[1]));
       if (f.lm_right_iris) crosshair(sx(f.lm_right_iris[0]), sy(f.lm_right_iris[1]));
 
       const tcolor = TENSION_COLOR[f.tension] || color;
       if (f.lm_left_eye && f.lm_left_eye.length) {
         const [lx, ly] = [sx(f.lm_left_eye[0][0]), sy(f.lm_left_eye[0][1])];
-        lbl(`ID:${f.id}`,              lx, ly - 30, tcolor);
-        lbl(`TENSION: ${f.tension}`,   lx, ly - 16, tcolor);
-        lbl('PSYCH_EVAL:',             lx, ly -  2, C.eye, 10);
-        lbl(f.psych,                   lx, ly + 12, tcolor);
+        lbl(`ID: ${f.id}`,              lx, ly - 38, tcolor, 13);
+        lbl(`TENSION: ${f.tension}`,    lx, ly - 22, tcolor, 13);
+        lbl('PSYCH EVALUATION:',        lx, ly -  6, C.eye,  11);
+        lbl(f.psych,                    lx, ly + 14, tcolor, 15);
       }
 
       if (g.state === 'ANALYZE') {
@@ -575,11 +590,11 @@ function render(ts) {
         const acy = all.reduce((s, p) => s + sy(p[1]), 0) / all.length;
         ctx.save();
         ctx.strokeStyle = color;
-        ctx.lineWidth   = 0.6;
-        glow(color, 3);
+        ctx.lineWidth   = 1.2;
+        glow(color, 6);
         for (let i = 0; i < 12; i++) {
           const a = (i / 12) * Math.PI * 2 + t * 0.25;
-          ctx.globalAlpha = 0.25 + 0.12 * Math.sin(t * 1.8 + i);
+          ctx.globalAlpha = 0.55 + 0.2 * Math.sin(t * 1.8 + i);
           ctx.beginPath();
           ctx.moveTo(acx + 55 * Math.cos(a), acy + 55 * Math.sin(a));
           ctx.lineTo(acx + 80 * Math.cos(a), acy + 80 * Math.sin(a));
@@ -596,40 +611,129 @@ function render(ts) {
   }
 
   // ── BLESS ─────────────────────────────────────────────────────────────────
+  // Two-phase sequence driven by bless_p (0 → 1):
+  //   Phase 1 (0 → 0.55): a bright glowing dot traces face contours,
+  //                        leaving a persistent light trail behind it.
+  //   Phase 2 (0.45 → 1): biometric data radiates outward from the face;
+  //                        psych verdict fades in at the end.
   if (g.state === 'BLESS') {
-    const gold = C.BLESS;
+    const gold    = C.BLESS;
+    const bp      = g.bless_p;
+    const TRACE_END  = 0.55;
+    const DATA_START = 0.45;
 
-    g.mp_faces.forEach(f => {
-      const scaleP = p => [sx(p[0]), sy(p[1])];
-      polyline(f.lm_left_eye.map(scaleP),  gold, 1.5);
-      polyline(f.lm_right_eye.map(scaleP), gold, 1.5);
-      polyline(f.lm_lips.map(scaleP),      gold, 1.5);
+    const blessFaces = g.mp_faces.length > 0 ? g.mp_faces : _lastAnalysisFaces;
+
+    blessFaces.forEach(f => {
+      const sp = pt => [sx(pt[0]), sy(pt[1])];
+
+      // Trace path: right eye → left eye → lips (closed loops)
+      const tracePath = [
+        ...f.lm_right_eye, f.lm_right_eye[0],
+        ...f.lm_left_eye,  f.lm_left_eye[0],
+        ...f.lm_lips,      f.lm_lips[0],
+      ].map(sp);
+      const n = tracePath.length;
+
+      // Face centre for data radiation
+      const allPts = [...f.lm_left_eye, ...f.lm_right_eye, ...f.lm_lips].map(sp);
+      const fcx = allPts.reduce((s, p) => s + p[0], 0) / allPts.length;
+      const fcy = allPts.reduce((s, p) => s + p[1], 0) / allPts.length;
+
+      // ── Phase 1: tracing ────────────────────────────────────────────────
+      const traceP  = Math.min(bp / TRACE_END, 1.0);
+      const dotPos  = traceP * (n - 1);
+      const dotIdx  = Math.floor(dotPos);
+      const dotFrac = dotPos - dotIdx;
+      const drawn   = Math.min(dotIdx + 1, n);
+
+      // Glowing trail up to dot position
+      if (drawn >= 2) {
+        ctx.save();
+        ctx.strokeStyle = gold;
+        ctx.lineWidth   = 2.0;
+        ctx.globalAlpha = traceP >= 1.0
+          ? 0.55 + 0.2 * Math.abs(Math.sin(t * 1.1))   // pulse after complete
+          : 0.9;
+        glow(gold, 12);
+        ctx.beginPath();
+        ctx.moveTo(tracePath[0][0], tracePath[0][1]);
+        for (let i = 1; i < drawn; i++) ctx.lineTo(tracePath[i][0], tracePath[i][1]);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Moving dot with bright point-of-light glow
+      if (traceP < 1.0 && dotIdx < n - 1) {
+        const px = tracePath[dotIdx][0] + (tracePath[dotIdx+1][0] - tracePath[dotIdx][0]) * dotFrac;
+        const py = tracePath[dotIdx][1] + (tracePath[dotIdx+1][1] - tracePath[dotIdx][1]) * dotFrac;
+
+        if (t - _lastSpawn > 0.06) {
+          spawnParticles(px, py, gold, 3);
+          _lastSpawn = t;
+        }
+        ctx.save();
+        // Outer bloom
+        ctx.globalAlpha = 0.45;
+        glow(gold, 22);
+        ctx.fillStyle = gold;
+        ctx.beginPath(); ctx.arc(px, py, 9, 0, Math.PI * 2); ctx.fill();
+        // Bright core
+        ctx.globalAlpha = 1.0;
+        glow('#ffffff', 18);
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath(); ctx.arc(px, py, 3, 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
+      }
+
+      // ── Phase 2: data cascade ────────────────────────────────────────────
+      if (bp >= DATA_START) {
+        const dataP = Math.min((bp - DATA_START) / (1 - DATA_START), 1.0);
+
+        // Each entry: [label, angle°, max_dist_px, appears_at_dataP_fraction]
+        const re0 = f.lm_right_eye[0], le0 = f.lm_left_eye[0], lp0 = f.lm_lips[0];
+        const dataItems = [
+          [`ID // ${f.id}`,                          -65,  105, 0.00],
+          [`EAR  ${f.ear}`,                           25,  100, 0.12],
+          [`MOUTH  ${f.mouth_h}`,                    155,   98, 0.22],
+          [`[${re0[0]}, ${re0[1]}]`,                -130,  118, 0.32],
+          [`[${le0[0]}, ${le0[1]}]`,                 -10,  112, 0.32],
+          [`[${lp0[0]}, ${lp0[1]}]`,                 105,  108, 0.40],
+          [`TENSION // ${f.tension}`,                -75,  138, 0.52],
+          [`PSYCH EVAL // ${f.psych}`,                35,  148, 0.68],
+        ];
+
+        ctx.save();
+        ctx.textAlign = 'center';
+        dataItems.forEach(([text, angleDeg, maxDist, threshold]) => {
+          if (dataP < threshold) return;
+          const itemP = Math.min((dataP - threshold) / 0.28, 1.0);
+          const angle = angleDeg * Math.PI / 180;
+          const dist  = itemP * maxDist;
+          ctx.globalAlpha = itemP * (0.85 + 0.15 * Math.abs(Math.sin(t * 1.6)));
+          glow(gold, text.startsWith('PSYCH') ? 12 : 7);
+          ctx.fillStyle = gold;
+          ctx.font = `${text.startsWith('PSYCH') ? 12 : 10}px 'Courier New', monospace`;
+          ctx.fillText(text, fcx + Math.cos(angle) * dist, fcy + Math.sin(angle) * dist);
+        });
+        ctx.restore();
+      }
     });
 
-    if (g.target) {
-      const [x1, y1, x2, y2] = g.target;
-      const hcx = sx((x1 + x2) / 2);
-      const hcy = sy(y1 - (y2 - y1) * 0.25);
-      const rx  = sx(x2 - x1) * 0.65;
-      const ry  = sx(x2 - x1) * 0.18;
-      ellipseHalo(hcx, hcy, rx, ry, gold, t);
-
-      if (t - _lastSpawn > 0.18) {
-        spawnParticles(hcx, hcy - ry, gold);
-        _lastSpawn = t;
-      }
-    }
     tickParticles();
 
-    // "BLESSED" centre title
-    ctx.save();
-    ctx.globalAlpha = 0.75 + 0.25 * Math.abs(Math.sin(t * 3));
-    ctx.font        = 'bold 38px Courier New, monospace';
-    ctx.textAlign   = 'center';
-    ctx.fillStyle   = gold;
-    glow(gold, 20);
-    ctx.fillText('BLESSED', W / 2, 68);
-    ctx.restore();
+    // Title fades in during data phase
+    if (bp > 0.48) {
+      const titleA = Math.min((bp - 0.48) / 0.18, 1.0) * (0.8 + 0.2 * Math.abs(Math.sin(t * 2)));
+      ctx.save();
+      ctx.globalAlpha = titleA;
+      ctx.font        = 'bold 32px Courier New, monospace';
+      ctx.textAlign   = 'center';
+      ctx.fillStyle   = gold;
+      glow(gold, 18);
+      ctx.fillText('SUBJECT DESIGNATED', W / 2, 68);
+      ctx.restore();
+    }
   }
 }
 requestAnimationFrame(render);
@@ -696,6 +800,14 @@ function connect() {
   ws.onmessage = ({ data }) => {
     try {
       g = JSON.parse(data);
+      // Keep a frozen copy of face analysis from ANALYZE/ZOOM so BLESS
+      // can continue displaying it even if MediaPipe drops a frame.
+      if ((g.state === 'ANALYZE' || g.state === 'ZOOM') && g.mp_faces.length > 0) {
+        _lastAnalysisFaces = g.mp_faces;
+      }
+      if (g.state === 'VIGIL' || g.state === 'HUNT') {
+        _lastAnalysisFaces = [];  // reset between subjects
+      }
       updateHUD();
     } catch(_) {}
   };
