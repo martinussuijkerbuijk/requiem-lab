@@ -90,7 +90,7 @@ PALETTE = {
     State.CENTER:  (0,   50, 255),   # red — aggressive target-lock feel
     State.ZOOM:    (0,  200, 255),
     State.ANALYZE: (255, 255,  0),
-    State.BLESS:   (30, 200, 255),
+    State.BLESS:   (220, 0, 255),
 }
 
 
