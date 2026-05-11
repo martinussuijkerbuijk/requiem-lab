@@ -11,6 +11,7 @@ the Reolink API provides no absolute position feedback.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import math
@@ -233,16 +234,26 @@ class CameraController:
         print("[Camera] Stream thread started.")
 
     def _stream_loop(self):
-        try:
-            stream = self._camera.open_video_stream()
-            for frame in stream:
-                if not self._stream_active:
-                    break
+        # Force TCP transport to avoid HEVC bitstream corruption from UDP packet loss.
+        # The RtspClient default (UDP) causes CABAC_MAX_BIN / cu_qp_delta errors that
+        # corrupt frames and make face detection fail intermittently.
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+        url = (f"rtsp://{self.username}:{self.password}"
+               f"@{self.ip}:554//h264Preview_01_{self.profile}")
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        print(f"[Camera] Stream opened via TCP ({self.profile} stream).")
+        while self._stream_active:
+            ret, frame = cap.read()
+            if ret:
                 with self._frame_lock:
                     self._frame = frame
-        except Exception as exc:
-            print(f"[Camera] Stream error: {exc}")
-            self._stream_active = False
+            else:
+                print("[Camera] Stream read failed — reconnecting in 1 s …")
+                cap.release()
+                time.sleep(1.0)
+                if self._stream_active:
+                    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        cap.release()
 
     def get_frame(self) -> np.ndarray | None:
         with self._frame_lock:

@@ -46,8 +46,10 @@ html, body {
   filter: grayscale(1) brightness(0.85) sepia(0.6) hue-rotate(175deg) saturate(3);
   transition: filter 2.5s ease;
 }
-body.bless  #feed { filter: brightness(1.05) sepia(0.5) saturate(1.8) hue-rotate(10deg); }
-body.vigil  #feed { filter: grayscale(1) brightness(0.6) sepia(0.4) hue-rotate(200deg) saturate(2); }
+body.bless     #feed { filter: brightness(1.05) sepia(0.5) saturate(1.8) hue-rotate(10deg); }
+body.vigil     #feed { filter: grayscale(1) brightness(0.6) sepia(0.4) hue-rotate(200deg) saturate(2); }
+body.archive   #feed { filter: grayscale(1) brightness(0.7) sepia(0.5) hue-rotate(175deg) saturate(2.5); }
+body.composite #feed { filter: grayscale(1) brightness(0.2); }
 
 /* Detection canvas — same pixel dimensions as the video */
 #overlay {
@@ -215,8 +217,31 @@ let g = {
   blessed_n: 0, last_psych: 'COMPLIANT',
 };
 
-// Cache the last known face analysis so BLESS can keep showing it
+// Cache the last known face analysis so BLESS/ARCHIVE/COMPOSITE can keep showing it
 let _lastAnalysisFaces = [];
+
+// ── Archive: 4 corner slots, each holds a captured canvas ────────────────────
+const MAX_ARCHIVE = 4;
+const ARCHIVE_GRID = [
+  {dx:   0, dy:   0, dw: 320, dh: 180},   // top-left
+  {dx: 960, dy:   0, dw: 320, dh: 180},   // top-right
+  {dx:   0, dy: 540, dw: 320, dh: 180},   // bottom-left
+  {dx: 960, dy: 540, dw: 320, dh: 180},   // bottom-right
+];
+const _archiveCanvases  = Array.from({length: MAX_ARCHIVE}, () => {
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H; return c;
+});
+const _archiveFilled    = Array(MAX_ARCHIVE).fill(false);
+const _archiveSnapTimes = Array(MAX_ARCHIVE).fill(-999);
+let   _archiveCaptured  = false;   // capture guard per ARCHIVE entry
+
+// ── Composite: persistent accumulation canvas ─────────────────────────────────
+const _compositeCanvas = document.createElement('canvas');
+_compositeCanvas.width = W; _compositeCanvas.height = H;
+const _compositeCtx    = _compositeCanvas.getContext('2d');
+let   _compositeCount  = 0;
+let   _compositeAdded  = false;    // accumulation guard per COMPOSITE entry
 
 // ── Scale: map frame coords → canvas coords ───────────────────────────────────
 // Frame dimensions may differ from 1280×720 but canvas is always 1280×720.
@@ -234,15 +259,17 @@ window.addEventListener('resize', fitViewport);
 
 // ── Color palette ─────────────────────────────────────────────────────────────
 const C = {
-  VIGIL:   '#00e078',
-  HUNT:    '#00ff88',
-  CENTER:  '#e83030',
-  ZOOM:    '#00e5ff',
-  ANALYZE: '#aaff00',
-  BLESS:   '#ffd060',
-  eye:     '#00ffff',
-  lip:     '#ff00aa',
-  iris:    '#ff3322',
+  VIGIL:     '#00e078',
+  HUNT:      '#00ff88',
+  CENTER:    '#e83030',
+  ZOOM:      '#00e5ff',
+  ANALYZE:   '#aaff00',
+  BLESS:     '#ffd060',
+  ARCHIVE:   '#00e5ff',
+  COMPOSITE: '#ff9500',
+  eye:       '#00ffff',
+  lip:       '#ff00aa',
+  iris:      '#ff3322',
 };
 const TENSION_COLOR = {
   NOMINAL:  '#00ff88',
@@ -735,17 +762,157 @@ function render(ts) {
       ctx.restore();
     }
   }
+
+  // ── ARCHIVE ───────────────────────────────────────────────────────────────
+  // Capture current MJPEG frame on first ARCHIVE frame, snap it into its slot.
+  if (g.state === 'ARCHIVE') {
+    const slot = g.archive_slot >= 0 ? g.archive_slot % MAX_ARCHIVE : 0;
+    if (!_archiveCaptured) {
+      const tmpCtx = _archiveCanvases[slot].getContext('2d');
+      tmpCtx.drawImage(document.getElementById('feed'), 0, 0, W, H);
+      _archiveFilled[slot]    = true;
+      _archiveSnapTimes[slot] = t;
+      _archiveCaptured        = true;
+    }
+
+    // Flash on the newly snapped slot
+    const snapAge = t - _archiveSnapTimes[slot];
+    if (snapAge < 0.6) {
+      const sg = ARCHIVE_GRID[slot];
+      ctx.save();
+      ctx.globalAlpha = (1 - snapAge / 0.6) * 0.9;
+      ctx.fillStyle   = '#ffffff';
+      ctx.fillRect(sg.dx, sg.dy, sg.dw, sg.dh);
+      ctx.restore();
+    }
+
+    // "ARCHIVED" label on active slot
+    const sg = ARCHIVE_GRID[slot];
+    ctx.save();
+    ctx.globalAlpha = 0.9;
+    ctx.font        = 'bold 13px Courier New, monospace';
+    ctx.textAlign   = 'left';
+    ctx.fillStyle   = C.ARCHIVE;
+    glow(C.ARCHIVE, 10);
+    ctx.fillText('ARCHIVED', sg.dx + 8, sg.dy + sg.dh - 10);
+    ctx.restore();
+  }
+
+  // ── COMPOSITE ─────────────────────────────────────────────────────────────
+  // On first frame of COMPOSITE, draw the current face landmarks onto the
+  // persistent accumulation canvas, then display it full-screen.
+  if (g.state === 'COMPOSITE') {
+    const col   = C.COMPOSITE;
+    const faces = g.mp_faces.length > 0 ? g.mp_faces : _lastAnalysisFaces;
+
+    if (!_compositeAdded && faces.length > 0) {
+      const f  = faces[0];
+      const sp = pt => [sx(pt[0]), sy(pt[1])];
+      _compositeCtx.save();
+      _compositeCtx.globalAlpha  = 0.55;
+      _compositeCtx.strokeStyle  = C.eye;
+      _compositeCtx.lineWidth    = 2.5;
+      _compositeCtx.shadowColor  = C.eye;
+      _compositeCtx.shadowBlur   = 10;
+      // Right eye
+      const re = f.lm_right_eye.map(sp);
+      _compositeCtx.beginPath();
+      _compositeCtx.moveTo(re[0][0], re[0][1]);
+      re.forEach(p => _compositeCtx.lineTo(p[0], p[1]));
+      _compositeCtx.closePath(); _compositeCtx.stroke();
+      // Left eye
+      const le = f.lm_left_eye.map(sp);
+      _compositeCtx.beginPath();
+      _compositeCtx.moveTo(le[0][0], le[0][1]);
+      le.forEach(p => _compositeCtx.lineTo(p[0], p[1]));
+      _compositeCtx.closePath(); _compositeCtx.stroke();
+      // Lips
+      _compositeCtx.strokeStyle = C.lip;
+      _compositeCtx.shadowColor = C.lip;
+      const lp = f.lm_lips.map(sp);
+      _compositeCtx.beginPath();
+      _compositeCtx.moveTo(lp[0][0], lp[0][1]);
+      lp.forEach(p => _compositeCtx.lineTo(p[0], p[1]));
+      _compositeCtx.closePath(); _compositeCtx.stroke();
+      // Iris marks
+      if (f.lm_left_iris) {
+        const ix = sx(f.lm_left_iris[0]), iy = sy(f.lm_left_iris[1]);
+        _compositeCtx.strokeStyle = '#ffffff';
+        _compositeCtx.shadowColor = '#ffffff';
+        _compositeCtx.lineWidth   = 1.5;
+        _compositeCtx.beginPath();
+        _compositeCtx.moveTo(ix - 8, iy); _compositeCtx.lineTo(ix + 8, iy);
+        _compositeCtx.moveTo(ix, iy - 8); _compositeCtx.lineTo(ix, iy + 8);
+        _compositeCtx.stroke();
+      }
+      if (f.lm_right_iris) {
+        const ix = sx(f.lm_right_iris[0]), iy = sy(f.lm_right_iris[1]);
+        _compositeCtx.beginPath();
+        _compositeCtx.moveTo(ix - 8, iy); _compositeCtx.lineTo(ix + 8, iy);
+        _compositeCtx.moveTo(ix, iy - 8); _compositeCtx.lineTo(ix, iy + 8);
+        _compositeCtx.stroke();
+      }
+      _compositeCtx.restore();
+      _compositeCount++;
+      _compositeAdded = true;
+    }
+
+    // Draw accumulated composite full-screen
+    if (_compositeCount > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.9;
+      ctx.drawImage(_compositeCanvas, 0, 0);
+      ctx.restore();
+    }
+
+    // Counter label
+    ctx.save();
+    ctx.globalAlpha = 0.85 + 0.15 * Math.abs(Math.sin(t * 1.5));
+    ctx.font        = 'bold 28px Courier New, monospace';
+    ctx.textAlign   = 'center';
+    ctx.fillStyle   = col;
+    glow(col, 16);
+    ctx.fillText(`COMPOSITE  //  ${String(_compositeCount).padStart(3,'0')} SUBJECTS`, W / 2, 68);
+    ctx.restore();
+  }
+
+  // ── Persistent archive grid — drawn in ALL states ──────────────────────────
+  // Filled slots remain visible throughout the performance as a growing record.
+  _archiveFilled.forEach((filled, i) => {
+    if (!filled) return;
+    const sg      = ARCHIVE_GRID[i];
+    const isSnap  = g.state === 'ARCHIVE' && (g.archive_slot % MAX_ARCHIVE) === i;
+    const snapAge = t - _archiveSnapTimes[i];
+    ctx.save();
+    // Face image
+    ctx.globalAlpha = isSnap ? 0.9 : 0.65;
+    ctx.drawImage(_archiveCanvases[i], 0, 0, W, H,
+                  sg.dx, sg.dy, sg.dw, sg.dh);
+    // Cold tint overlay
+    ctx.globalAlpha = 0.28;
+    ctx.fillStyle   = '#001a11';
+    ctx.fillRect(sg.dx, sg.dy, sg.dw, sg.dh);
+    // Border — brighter on active slot
+    ctx.globalAlpha = isSnap ? 1.0 : 0.55;
+    ctx.strokeStyle = C.ARCHIVE;
+    ctx.lineWidth   = isSnap ? 2 : 1;
+    glow(C.ARCHIVE, isSnap ? 10 : 0);
+    ctx.strokeRect(sg.dx + 1, sg.dy + 1, sg.dw - 2, sg.dh - 2);
+    ctx.restore();
+  });
 }
 requestAnimationFrame(render);
 
 // ── HUD DOM updates ───────────────────────────────────────────────────────────
 const STATE_MODE = {
-  VIGIL:   'STANDBY  //  AWAITING INPUT',
-  HUNT:    'SCANNING  //  ACQUIRING',
-  CENTER:  'TARGET LOCK  //  CENTERING',
-  ZOOM:    'TELESCOPING  //  CLOSING IN',
-  ANALYZE: 'FORENSIC ANALYSIS  //  PROCESSING',
-  BLESS:   '\u2746  SUBJECT DESIGNATED  \u2746',
+  VIGIL:     'STANDBY  //  AWAITING INPUT',
+  HUNT:      'SCANNING  //  ACQUIRING',
+  CENTER:    'TARGET LOCK  //  CENTERING',
+  ZOOM:      'TELESCOPING  //  CLOSING IN',
+  ANALYZE:   'FORENSIC ANALYSIS  //  PROCESSING',
+  BLESS:     '\u2746  SUBJECT DESIGNATED  \u2746',
+  ARCHIVE:   'RECORDING  //  SUBJECT FILED',
+  COMPOSITE: 'ACCUMULATING  //  BUILDING PORTRAIT',
 };
 
 let _prevState = '';
@@ -780,9 +947,11 @@ function updateHUD() {
   tensionEl.textContent = '';
 
   let prog = 0, progCol = C[s.state] || C.VIGIL;
-  if (s.state === 'ANALYZE') prog = s.analyze_p;
-  if (s.state === 'BLESS')   prog = s.bless_p;
-  if (s.state === 'CENTER')  prog = s.center_p;
+  if (s.state === 'ANALYZE')   prog = s.analyze_p;
+  if (s.state === 'BLESS')     prog = s.bless_p;
+  if (s.state === 'CENTER')    prog = s.center_p;
+  if (s.state === 'ARCHIVE')   prog = s.archive_p;
+  if (s.state === 'COMPOSITE') prog = s.composite_p;
   const pb = document.getElementById('progress-bar');
   pb.style.width           = `${prog * 100}%`;
   pb.style.background      = progCol;
@@ -799,15 +968,24 @@ function connect() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
   ws.onmessage = ({ data }) => {
     try {
+      const prev = g.state;
       g = JSON.parse(data);
-      // Keep a frozen copy of face analysis from ANALYZE/ZOOM so BLESS
-      // can continue displaying it even if MediaPipe drops a frame.
-      if ((g.state === 'ANALYZE' || g.state === 'ZOOM') && g.mp_faces.length > 0) {
+
+      // Keep face analysis alive through all treatment states
+      if (['ANALYZE','ZOOM','BLESS','ARCHIVE','COMPOSITE'].includes(g.state)
+          && g.mp_faces.length > 0) {
         _lastAnalysisFaces = g.mp_faces;
       }
       if (g.state === 'VIGIL' || g.state === 'HUNT') {
-        _lastAnalysisFaces = [];  // reset between subjects
+        _lastAnalysisFaces = [];
       }
+
+      // Reset per-entry capture guards on state transitions
+      if (g.state !== prev) {
+        if (g.state === 'ARCHIVE')   _archiveCaptured = false;
+        if (g.state === 'COMPOSITE') _compositeAdded  = false;
+      }
+
       updateHUD();
     } catch(_) {}
   };

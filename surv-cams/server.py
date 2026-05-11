@@ -61,6 +61,9 @@ ZOOM_TIMEOUT       = 20.0
 ZOOM_LOST_S        = 4.0
 ANALYZE_DURATION   = 15.0   # raised — audience needs time to read the analysis
 BLESS_DURATION     = 10.0   # raised — give the blessing ritual space to breathe
+ARCHIVE_DURATION   = 8.0    # time the archived face is held on screen
+COMPOSITE_DURATION = 8.0    # time the composite drawing is displayed
+MAX_ARCHIVE_SLOTS  = 4      # corner grid slots (top-left/right, bottom-left/right)
 ZOOM_OUT_DURATION  = 3.0
 DETECT_EVERY_N     = 4
 ZOOM_STEP          = 0.010
@@ -102,6 +105,7 @@ _data: dict = {
     "state": "VIGIL", "faces": [], "mp_faces": [], "target": None,
     "zoom": 1.0, "frame_w": 1280, "frame_h": 720, "t": 0.0, "elapsed": 0.0,
     "analyze_p": 0.0, "bless_p": 0.0, "center_p": 0.0,
+    "archive_p": 0.0, "composite_p": 0.0, "archive_slot": -1,
     "blessed_n": 0, "last_psych": "COMPLIANT",
 }
 _cmd_deque: collections.deque = collections.deque()
@@ -110,12 +114,14 @@ _cmd_deque: collections.deque = collections.deque()
 # ── State machine ─────────────────────────────────────────────────────────────
 
 class State(Enum):
-    VIGIL   = "VIGIL"
-    HUNT    = "HUNT"
-    CENTER  = "CENTER"
-    ZOOM    = "ZOOM"
-    ANALYZE = "ANALYZE"
-    BLESS   = "BLESS"
+    VIGIL     = "VIGIL"
+    HUNT      = "HUNT"
+    CENTER    = "CENTER"
+    ZOOM      = "ZOOM"
+    ANALYZE   = "ANALYZE"
+    BLESS     = "BLESS"
+    ARCHIVE   = "ARCHIVE"
+    COMPOSITE = "COMPOSITE"
 
 
 def _dist(p1, p2) -> float:
@@ -183,7 +189,8 @@ class RequiemEngine:
         self._hunt_detect_end : float      = 0.0
         self._hunt_seen_faces : list[tuple] = []  # faces collected during sweep
 
-        self._blessed_log : list[dict] = []
+        self._blessed_log  : list[dict] = []
+        self._archive_slot : int        = -1
 
     # ── Startup ───────────────────────────────────────────────────────────────
 
@@ -366,7 +373,7 @@ class RequiemEngine:
         self.state = s
         self._state_entered_at = time.time()
         if self._cam and getattr(self._args, 'spotlight', False):
-            if s in (State.ANALYZE, State.BLESS):
+            if s in (State.ANALYZE, State.BLESS, State.ARCHIVE, State.COMPOSITE):
                 print(f"[Lights] {s.value} → spotlight ON  (IR off, white 100%)")
                 self._cam.set_ir_lights("Off")
                 self._cam.set_white_led(True, bright=100)
@@ -723,15 +730,21 @@ class RequiemEngine:
             elif self.state == State.ANALYZE:
                 frame = _digital_zoom(frame, MAX_DIGITAL_ZOOM, self._zoom_cx, self._zoom_cy)
                 if elapsed >= ANALYZE_DURATION:
-                    self._transition(State.BLESS)
+                    # Randomly pick one of three treatments (equal probability)
+                    roll = random.random()
+                    if roll < 0.333:
+                        self._transition(State.BLESS)
+                    elif roll < 0.667:
+                        self._archive_slot = (self._archive_slot + 1) % MAX_ARCHIVE_SLOTS
+                        print(f"[Requiem] → ARCHIVE  slot={self._archive_slot}")
+                        self._transition(State.ARCHIVE)
+                    else:
+                        print("[Requiem] → COMPOSITE")
+                        self._transition(State.COMPOSITE)
 
             # ── BLESS ─────────────────────────────────────────────────────────
             elif self.state == State.BLESS:
                 if run_detect:
-                    # Detect on the pre-zoom frame so YOLO returns pre-zoom
-                    # coordinates — _ibox will then map them to display space.
-                    # (Running detect on the already-zoomed frame would produce
-                    # coords that _ibox double-transforms to wrong positions.)
                     self._detected = self._detect(pre_zoom_frame)
                 frame = _digital_zoom(frame, MAX_DIGITAL_ZOOM, self._zoom_cx, self._zoom_cy)
 
@@ -750,8 +763,33 @@ class RequiemEngine:
                         self._cam.stop_zoom()
                     self._start_hunt()
 
+            # ── ARCHIVE ───────────────────────────────────────────────────────
+            elif self.state == State.ARCHIVE:
+                if run_detect:
+                    self._detected = self._detect(pre_zoom_frame)
+                frame = _digital_zoom(frame, MAX_DIGITAL_ZOOM, self._zoom_cx, self._zoom_cy)
+
+                if elapsed >= ARCHIVE_DURATION:
+                    if self._cam:
+                        self._cam.zoom_to_minimum()
+                        time.sleep(ZOOM_OUT_DURATION)
+                        self._cam.stop_zoom()
+                    self._start_hunt()
+
+            # ── COMPOSITE ─────────────────────────────────────────────────────
+            elif self.state == State.COMPOSITE:
+                frame = _digital_zoom(frame, MAX_DIGITAL_ZOOM, self._zoom_cx, self._zoom_cy)
+
+                if elapsed >= COMPOSITE_DURATION:
+                    if self._cam:
+                        self._cam.zoom_to_minimum()
+                        time.sleep(ZOOM_OUT_DURATION)
+                        self._cam.stop_zoom()
+                    self._start_hunt()
+
             # ── Build snapshot ────────────────────────────────────────────────
-            needs_mesh = self.state in (State.ZOOM, State.ANALYZE, State.BLESS)
+            needs_mesh = self.state in (State.ZOOM, State.ANALYZE, State.BLESS,
+                                        State.ARCHIVE, State.COMPOSITE)
             mp_faces   = []
             if needs_mesh:
                 if self._zoom_factor > 1.0 and self._zoom_cx and self._zoom_cy:
@@ -799,7 +837,8 @@ class RequiemEngine:
             # we must map those coords before sending them to the browser.
             # MediaPipe landmarks use the crop as input and p.x*w as output, so
             # they are already in zoomed display space — no transform needed.
-            in_zoom = (self.state in (State.ZOOM, State.ANALYZE, State.BLESS)
+            in_zoom = (self.state in (State.ZOOM, State.ANALYZE, State.BLESS,
+                                       State.ARCHIVE, State.COMPOSITE)
                        and self._zoom_factor > 1.0
                        and self._zoom_cx and self._zoom_cy)
 
@@ -846,13 +885,18 @@ class RequiemEngine:
                 "frame_h":   int(h),
                 "t":         round(now, 3),
                 "elapsed":   round(elapsed, 3),
-                "analyze_p": round(min(elapsed / ANALYZE_DURATION, 1.0), 3)
-                             if self.state == State.ANALYZE else 0.0,
-                "bless_p":   round(min(elapsed / BLESS_DURATION, 1.0), 3)
-                             if self.state == State.BLESS else 0.0,
-                "center_p":  round(cp, 3),
-                "blessed_n": len(self._blessed_log),
-                "last_psych": self._last_psych,
+                "analyze_p":   round(min(elapsed / ANALYZE_DURATION, 1.0), 3)
+                               if self.state == State.ANALYZE else 0.0,
+                "bless_p":     round(min(elapsed / BLESS_DURATION, 1.0), 3)
+                               if self.state == State.BLESS else 0.0,
+                "archive_p":   round(min(elapsed / ARCHIVE_DURATION, 1.0), 3)
+                               if self.state == State.ARCHIVE else 0.0,
+                "composite_p": round(min(elapsed / COMPOSITE_DURATION, 1.0), 3)
+                               if self.state == State.COMPOSITE else 0.0,
+                "archive_slot": self._archive_slot,
+                "center_p":    round(cp, 3),
+                "blessed_n":   len(self._blessed_log),
+                "last_psych":  self._last_psych,
             }
 
             sw, sh = self._args.stream_width, self._args.stream_height
